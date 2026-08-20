@@ -1,0 +1,24 @@
+# binaries
+/oixproxy
+/oixproxy-*
+/cmd/oixproxy/oixproxy
+
+# local secrets and runtime
+config.json
+*.token
+.identity
+OpenSurge.yaml
+oixCloud.conf
+custom.conf
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# test / debug output
+*.log
+*.out
+/tmp/

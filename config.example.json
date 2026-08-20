@@ -1,0 +1,11 @@
+{
+  "accessToken": "replace-with-your-access-token",
+  "proxyMode": "map",
+  "servePort": 6172,
+  "mapBasePort": 7200,
+  "listenAddress": "127.0.0.1",
+  "simpleRules": false,
+  "oixParams": "",
+  "lanAuth": null,
+  "listeners": []
+}

@@ -1,0 +1,17 @@
+# Replace every field. Do not commit a real subscription.
+proxies:
+  - name: "example-hk"
+    type: snell
+    server: 127.0.0.1
+    port: 443
+    psk: "replace-me"
+    version: 4
+    reuse: true
+    obfs-opts:
+      mode: ech-tls
+      alpn: snell-ech/1
+      identity-version: 2
+      sni: example.com
+      path: /ws-tunnel-example
+      ech-config: "AA=="
+      skip-cert-verify: false
