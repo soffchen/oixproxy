@@ -32,6 +32,7 @@ type File struct {
 	ListenAddress string     `json:"listenAddress"`
 	LANAuth       *LANAuth   `json:"lanAuth"`
 	SimpleRules   bool       `json:"simpleRules"`
+	Filter        string     `json:"filter"`
 	Listeners     []Listener `json:"listeners"`
 	OixParams     string     `json:"oixParams"`
 	APIBase       string     `json:"apiBase,omitempty"`

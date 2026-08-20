@@ -47,6 +47,7 @@ func Main(args []string) error {
 	fs.StringVar(portFlag, "p", "", "")
 	node := fs.String("node", "", "")
 	fs.StringVar(node, "n", "", "")
+	filterFlag := fs.String("filter", "", "")
 	health := fs.String("healthcheck", "", "")
 	help := fs.Bool("help", false, "")
 	fs.BoolVar(help, "h", false, "")
@@ -104,10 +105,20 @@ func Main(args []string) error {
 	if *mapBase != 0 {
 		cfg.MapBasePort = *mapBase
 	}
+	if *filterFlag != "" {
+		cfg.Filter = *filterFlag
+	}
 
 	nodes, tmpl, err := LoadNodes(cfg, *profilePath)
 	if err != nil {
 		return err
+	}
+	nodes, err = profile.Filter(nodes, cfg.Filter)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(cfg.Filter) != "" && len(nodes) == 0 {
+		return fmt.Errorf("filter matched no nodes")
 	}
 	if *node != "" {
 		n, err := Find(nodes, *node)
@@ -220,6 +231,7 @@ func usageText(name string) string {
   --port, -p [host:]port         Proxy listen address (SOCKS5 + HTTP)
   --bind <host>                  Bind address for proxy listeners (default 127.0.0.1)
   --node, -n <name>              Force node name for dial mode
+  --filter <regexp>              Keep nodes matching Clash Meta filter (backtick-separated)
   --mode <single|map>            Select proxy mode (map default)
   --map                          Shortcut for --mode map
   --single                       Shortcut for --mode single

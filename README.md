@@ -41,9 +41,16 @@ curl --socks5-hostname 127.0.0.1:7200 -o /dev/null -w '%{http_code}\n' https://w
 | `mapBasePort` | `7200` | map 模式起始端口（可被 `--map-base-port` 覆盖） |
 | `listenAddress` | `127.0.0.1` | 默认绑定地址 |
 | `simpleRules` | `false` | 为 `true` 时向面板带 `simplerules=true` |
+| `filter` | `""` | 按节点名筛选，语法同 [Clash Meta filter](https://wiki.metacubex.one/config/proxy-groups/#filter)：正则，反引号分隔多条，按条的顺序保留 |
 | `oixParams` | `""` | 额外面板查询参数（不会改成 `clash=1`） |
 | `lanAuth` | 无 | `{ "username", "password" }`；环回地址不鉴权，非环回对 HTTP / SOCKS5 / HTTP CONNECT 生效 |
 | `listeners` | `[]` | map 模式下额外的固定端口：`name` / `type` / `port` / `node` / `listen` |
+
+`filter` / `--filter` 示例：`香港.*Premium` 与 `日本` 用反引号拼成一条，先留下香港 Premium，再留下日本：
+
+```json
+"filter": "香港.*Premium`日本"
+```
 
 身份文件与 `OpenSurge.yaml` 写在数据目录（`OIXCLOUD_DATA`，否则 `/data` 或 `~/.config/oixcloud-external-proxy-program`）。
 
@@ -57,6 +64,7 @@ curl --socks5-hostname 127.0.0.1:7200 -o /dev/null -w '%{http_code}\n' https://w
 --port, -p [host:]port         single 模式代理端口
 --bind <host>                  代理监听地址
 --node, -n <name>              只使用指定节点
+--filter <regexp>              按节点名筛选（同 Clash Meta filter，反引号分隔）
 --mode <single|map>            模式
 --map / --single               模式快捷方式
 --map-base-port <port>         map 起始端口

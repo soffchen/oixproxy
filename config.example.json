@@ -5,6 +5,7 @@
   "mapBasePort": 7200,
   "listenAddress": "127.0.0.1",
   "simpleRules": false,
+  "filter": "",
   "oixParams": "",
   "lanAuth": null,
   "listeners": []
