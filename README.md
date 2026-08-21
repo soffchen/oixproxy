@@ -1,33 +1,107 @@
-# oixproxy
+# 开源的 oixCloud Surge / OpenSurge 助手 / helper
 
-开源的 oixCloud **专属 helper** 数据面（CGO-free，可在 Linux / macOS 运行，后续可交叉编译到 Windows、OpenWrt）。
+把 oixCloud 节点接入 Surge，或使用 OpenSurge GUI 构建 DHCP/DNS 全屋网关。
 
-用 `accessToken` 登录后，把面板下发的 **snell + ech-tls** 节点映到本机 SOCKS5（同一端口也接 HTTP CONNECT），再对外提供 Surge / Clash / 节点列表 / OpenSurge 配置。客户端侧只有本地 socks5，**不会**出现 PSK、ECH、anytls 密码。
+Connect oixCloud nodes to Surge, or build a DHCP/DNS gateway with the OpenSurge GUI.
+
+本仓库是 [oixcloud-external-proxy-program](https://github.com/pickrui/oixcloud-external-proxy-program) 的开源数据面。用 `accessToken` 登录后，把面板下发的 **snell + ech-tls** 节点映到本机 SOCKS5（同一端口也接 HTTP CONNECT），再对外提供 Surge / Clash / 节点列表 / OpenSurge 配置。客户端侧只有本地 socks5，**不会**出现 PSK、ECH、anytls 密码。
+
+参数和 `config.json` 对齐官方助手在 Docker / OpenSurge 一侧的行为。不含官方 macOS 菜单栏；DHCP/TUN 由 OpenSurge 自己负责。需要菜单栏、一键接入 Surge、自动更新时，请用官方发行版。
 
 公开订阅 `clash=1`（`type: anytls`）**不是**专属节点源，本程序不会去拉它。
 
-参数和 `config.json` 对齐官方 `oixcloud-external-proxy-program`（`docker.md` / `opensurge.md` 里 helper 那一侧）。不含官方 macOS 菜单栏、DHCP/TUN（那是 OpenSurge 自己的事）。
+## 选择部署方式
+
+| 场景 | 做法 |
+|---|---|
+| 在当前机器使用 Surge | 继续阅读本页「快速开始」 |
+| 使用 OpenSurge GUI 与 DHCP/DNS 接管 | [OpenSurge](#opensurge) |
+| 部署到 Linux、NAS 或家用服务器 | 同一二进制，把 listen/bind 改成 `0.0.0.0`，并建议配置 `lanAuth` |
+| 保留现有 Surge 配置或自定义规则 | 用 `/list` 作为 `policy-path`，见 [保留现有 Surge 配置](#保留现有-surge-配置) |
 
 ## 快速开始
+
+准备：
+
+- Surge for Mac，或其它会消费 Surge / Clash 托管配置的客户端
+- oixCloud 账户和 Access Token
 
 ```bash
 cp config.example.json config.json   # 填 accessToken
 ./oixproxy --map --listen 127.0.0.1:6172 --bind 127.0.0.1 --config ./config.json
 ```
 
-局域网访问把 listen/bind 改成 `0.0.0.0`（并建议配置 `lanAuth`）。
-
 未指定 `--config` 时依次尝试：
 
 - `~/.config/oixcloud-external-proxy-program/config.json`
 - `/config/config.json`（Docker 挂载）
+
+默认使用本地多端口映射（`map`），节点直接在 Surge 策略组中选择。`map` 模式从 `mapBasePort`（默认 `7200`）起为每个节点占一个连续端口，请保证这段端口空闲。
+
+本机验收：
 
 ```bash
 curl -f http://127.0.0.1:6172/health
 curl --socks5-hostname 127.0.0.1:7200 -o /dev/null -w '%{http_code}\n' https://www.google.com/generate_204
 ```
 
-`map` 模式从 `mapBasePort` 起为每个节点占一个连续端口。请保证这段端口空闲（本机若已有进程占着其中某一个，启动会失败）。
+完成标志：
+
+- `GET /health` 返回 `ok`
+- Surge 出现 oixCloud 配置和节点策略组
+- 切换节点后可以正常访问网络
+
+`/health` 不返回账户、节点或配置内容。
+
+## 接入 Surge
+
+在 Surge 中添加托管配置，地址为配置服务：
+
+```text
+完整配置    http://127.0.0.1:6172/
+节点列表    http://127.0.0.1:6172/list
+Clash       http://127.0.0.1:6172/clash
+```
+
+同一局域网设备改用助手所在主机的 IP；开启 `lanAuth` 时写成：
+
+```text
+http://用户名:密码@主机IP:6172/
+http://用户名:密码@主机IP:6172/list
+http://用户名:密码@主机IP:6172/clash
+```
+
+配置服务根据客户端访问的 Host 填写代理地址：从 `http://127.0.0.1:6172/` 拉到的是环回；从 `http://<局域网IP>:6172/` 拉到的指向该 IP。
+
+Surge 首次要求安装时确认，然后开启 `Set as System Proxy`。
+
+## 接入模式
+
+| 模式 | 节点选择位置 | 本地端口 |
+|---|---|---|
+| `map`，默认 | Surge 策略组 | 从 `7200` 起，每个节点一个端口 |
+| `single` | `--node` / 配置里只留一个节点 | 默认 `7100` |
+
+```json
+{
+  "proxyMode": "map",
+  "mapBasePort": 7200
+}
+```
+
+固定节点端口：
+
+```json
+{
+  "proxyMode": "map",
+  "listeners": [
+    { "name": "香港", "port": 7801, "node": "香港 01" },
+    { "name": "日本", "type": "socks5", "port": 7802, "node": "日本 01" }
+  ]
+}
+```
+
+`type` 可选 `mixed`、`socks5`、`http`，默认 `mixed`。本程序的额外端口目前一律按 mixed（SOCKS5 + HTTP CONNECT）监听。
 
 ## 配置文件
 
@@ -46,6 +120,12 @@ curl --socks5-hostname 127.0.0.1:7200 -o /dev/null -w '%{http_code}\n' https://w
 | `lanAuth` | 无 | `{ "username", "password" }`；环回地址不鉴权，非环回对 HTTP / SOCKS5 / HTTP CONNECT 生效 |
 | `listeners` | `[]` | map 模式下额外的固定端口：`name` / `type` / `port` / `node` / `listen` |
 
+最小配置：
+
+```json
+{ "accessToken": "你的 Access Token" }
+```
+
 `filter` / `--filter` 示例：`香港.*Premium` 与 `日本` 用反引号拼成一条，先留下香港 Premium，再留下日本：
 
 ```json
@@ -53,6 +133,63 @@ curl --socks5-hostname 127.0.0.1:7200 -o /dev/null -w '%{http_code}\n' https://w
 ```
 
 身份文件与 `OpenSurge.yaml` 写在数据目录（`OIXCLOUD_DATA`，否则 `/data` 或 `~/.config/oixcloud-external-proxy-program`）。
+
+## 局域网访问
+
+默认仅监听 `127.0.0.1`。局域网访问把 listen/bind 改成 `0.0.0.0`，并建议配置 `lanAuth`：
+
+```bash
+./oixproxy --map --listen 0.0.0.0:6172 --bind 0.0.0.0 --config ./config.json
+```
+
+这些 URL 使用 HTTP，HTTP Basic 仅做 Base64 编码而非加密，必须由防火墙限制在可信局域网内，禁止直接暴露公网。
+
+## 保留现有 Surge 配置
+
+不使用完整托管配置时，可在现有策略组中使用本地节点列表：
+
+```ini
+香港 = select, policy-path=http://127.0.0.1:6172/list, policy-regex-filter="香港|HK", update-interval=600
+Premium = select, policy-path=http://127.0.0.1:6172/list, policy-regex-filter="Premium", update-interval=600
+```
+
+现有 `policy-regex-filter` 继续按本地节点名过滤。
+
+## OpenSurge
+
+OpenSurge 提供 Web GUI、mihomo TUN、DHCP/DNS、设备策略和流量观察；本助手继续负责 oixCloud 账户、节点与本地出站。两者通过 `127.0.0.1` 上的 HTTP proxy provider 与本地代理端口通信。
+
+1. helper 保持运行。
+2. 用 `GET /opensurge` 检查，或使用数据目录里写出的 `OpenSurge.yaml`（目录 `0700`，文件 `0600`）：
+
+   ```text
+   ~/.config/oixcloud-external-proxy-program/OpenSurge.yaml
+   ```
+
+3. 在 OpenSurge「来源」里导入**本地 YAML**，不要把 `http://127.0.0.1:6172/opensurge` 填进 HTTPS 订阅框。OpenSurge 会拒绝 loopback HTTP URL 导入，这是其 SSRF 安全边界。
+4. 在 OpenSurge 的「网络设置」中选择局域网 DHCP 接管、旁路由或独立下游 LAN。
+
+局域网 DHCP 接管不会自动修改路由器，必须按 OpenSurge 恢复状态机人工关闭和恢复路由器 DHCP，禁止同时运行两个 DHCP 服务器。
+
+YAML 内容与官方 helper 一致：`oixcloud-nodes` HTTP provider（`/clash`，10 分钟刷新、5 分钟健康检查）、`oixCloud` Selector、helper 进程直连规则、`MATCH,oixCloud`。provider 只暴露本地端口，不包含远端节点地址、PSK 或 ECH。开启 `lanAuth` 时 provider URL 会带 Basic Auth，不要把这份 YAML 转发出去。
+
+节点切换和面板节点更新通常不需要重新导出，OpenSurge 可在 Provider 页面手动刷新。修改配置服务端口、局域网鉴权或 helper 路径后，需要重新导入 YAML。
+
+helper 必须先于 OpenSurge 启动。helper 退出时现有 OpenSurge 连接会失败，重新打开 helper 后刷新 provider。
+
+详细步骤、运行边界与排错见官方 [OpenSurge 接入与 DHCP/DNS 接管](https://github.com/pickrui/oixcloud-external-proxy-program/blob/main/docs/opensurge.md)。
+
+## HTTP 接口
+
+| 路径 | 内容 |
+|---|---|
+| `/health` | `ok` |
+| `/` | 完整 Surge 托管配置（`#!MANAGED-CONFIG`） |
+| `/clash` | Clash / mihomo provider，`type: socks5` |
+| `/list` | Surge policy-path：`name = socks5, host, port`；环回带 `udp-relay=true` |
+| `/opensurge` | OpenSurge 用的 mihomo overlay（只读检查，不要当 HTTPS 订阅源） |
+
+客户端产物里只有本地 socks5，没有远端节点地址、PSK、ECH。
 
 ## 命令行
 
@@ -78,31 +215,31 @@ curl --socks5-hostname 127.0.0.1:7200 -o /dev/null -w '%{http_code}\n' https://w
 
 额外支持 `--profile <yaml>`：跳过面板，直接读本地专属 YAML（调试用）。
 
-## HTTP 接口
+## 常用操作
 
-配置服务根据客户端访问的 Host 填写代理地址：从 `http://127.0.0.1:6172/` 拉到的是环回；从 `http://<局域网IP>:6172/` 拉到的指向该 IP。
-
-| 路径 | 内容 |
+| 需求 | 入口 |
 |---|---|
-| `/health` | `ok` |
-| `/` | 完整 Surge 托管配置（`#!MANAGED-CONFIG`） |
-| `/clash` | Clash / mihomo provider，`type: socks5` |
-| `/list` | Surge policy-path：`name = socks5, host, port`；环回带 `udp-relay=true` |
-| `/opensurge` | OpenSurge 用的 mihomo overlay（只读检查，不要当 HTTPS 订阅源） |
+| 查看运行状态 | `curl -f http://127.0.0.1:6172/health` |
+| 切换接入模式 | `proxyMode` / `--map` / `--single` |
+| 修改规则后同步 | 重启 helper，让 Surge 刷新托管配置 |
+| 导出 OpenSurge profile | 数据目录中的 `OpenSurge.yaml`，或 `GET /opensurge` 检查 |
+| 允许局域网访问 | `--listen 0.0.0.0:6172 --bind 0.0.0.0`，并配置 `lanAuth` |
+| 筛选节点 | `filter` / `--filter` |
 
-客户端产物里只有本地 socks5，没有远端节点地址、PSK、ECH。
+## 更多
 
-## OpenSurge
-
-1. helper 保持运行。
-2. 用 `GET /opensurge` 检查，或使用数据目录里写出的 `OpenSurge.yaml`（目录 `0700`，文件 `0600`）。
-3. 在 OpenSurge「来源」里导入**本地 YAML**，不要把 `http://127.0.0.1:6172/opensurge` 填进 HTTPS 订阅框。
-
-YAML 内容与官方 helper 一致：`oixcloud-nodes` HTTP provider（`/clash`，10 分钟刷新、5 分钟健康检查）、`oixCloud` Selector、helper 进程直连规则、`MATCH,oixCloud`。开启 `lanAuth` 时 provider URL 会带 Basic Auth，不要把这份 YAML 转发出去。
+- 官方发行版、菜单栏与 Docker 镜像：[oixcloud-external-proxy-program](https://github.com/pickrui/oixcloud-external-proxy-program)
+- [配置、接入模式、现有 Surge 配置和局域网访问](https://github.com/pickrui/oixcloud-external-proxy-program/blob/main/docs/configuration.md)
+- [OpenSurge GUI 与 DHCP/DNS 接管](https://github.com/pickrui/oixcloud-external-proxy-program/blob/main/docs/opensurge.md)
+- [Docker 部署与更新](https://github.com/pickrui/oixcloud-external-proxy-program/blob/main/docs/docker.md)
+- [常见问题与日志](https://github.com/pickrui/oixcloud-external-proxy-program/blob/main/docs/troubleshooting.md)
+- [Surge 官方手册](https://manual.nssurge.com/)
 
 ## 许可与仓库卫生
 
 MIT。不要把 `config.json`、专属订阅 YAML、token 文件或 `.identity` 提交进仓库。
+
+官方 [oixcloud-external-proxy-program](https://github.com/pickrui/oixcloud-external-proxy-program) 为专有软件，详见其 [NOTICE](https://github.com/pickrui/oixcloud-external-proxy-program/blob/main/NOTICE)。
 
 默认 `go test ./...` 只打本地夹具，不含真实订阅。联通性测试必须显式打开：
 
