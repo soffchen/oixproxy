@@ -1,8 +1,8 @@
-# 开源的 oixCloud Surge / OpenSurge 助手 / helper
+# 开源的 oixCloud Surge / OpenSurge / Clash 转换器
 
-把 oixCloud 节点接入 Surge，或使用 OpenSurge GUI 构建 DHCP/DNS 全屋网关。
+把 oixCloud 节点转换成 Surge / Clash 配置，或配合 OpenSurge GUI 构建 DHCP/DNS 全屋网关。
 
-Connect oixCloud nodes to Surge, or build a DHCP/DNS gateway with the OpenSurge GUI.
+Convert oixCloud nodes to Surge / Clash profiles, or build a DHCP/DNS gateway with the OpenSurge GUI.
 
 本仓库是 [oixcloud-external-proxy-program](https://github.com/pickrui/oixcloud-external-proxy-program) 的开源数据面。用 `accessToken` 登录后，把面板下发的 **snell + ech-tls** 节点映到本机 SOCKS5（同一端口也接 HTTP CONNECT），再对外提供 Surge / Clash / 节点列表 / OpenSurge 配置。客户端侧只有本地 socks5，**不会**出现 PSK、ECH、anytls 密码。
 
