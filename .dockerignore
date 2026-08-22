@@ -1,0 +1,21 @@
+.git
+.github
+.DS_Store
+.idea
+.vscode
+
+# local binaries and build output
+/oixproxy
+/oixproxy-*
+/cmd/oixproxy/oixproxy
+/dist
+*.log
+*.out
+
+# secrets and runtime
+config.json
+custom.conf
+.identity
+OpenSurge.yaml
+oixCloud.conf
+*.token

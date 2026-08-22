@@ -16,7 +16,7 @@ Convert oixCloud nodes to Surge / Clash profiles, or build a DHCP/DNS gateway wi
 |---|---|
 | 在当前机器使用 Surge | 继续阅读本页「快速开始」 |
 | 使用 OpenSurge GUI 与 DHCP/DNS 接管 | [OpenSurge](#opensurge) |
-| 部署到 Linux、NAS 或家用服务器 | 同一二进制，把 listen/bind 改成 `0.0.0.0`，并建议配置 `lanAuth` |
+| 部署到 Linux、NAS 或家用服务器 | [Docker 部署](#docker-部署) |
 | 保留现有 Surge 配置或自定义规则 | 用 `/list` 作为 `policy-path`，见 [保留现有 Surge 配置](#保留现有-surge-配置) |
 
 ## 快速开始
@@ -52,6 +52,67 @@ curl --socks5-hostname 127.0.0.1:7200 -o /dev/null -w '%{http_code}\n' https://w
 - 切换节点后可以正常访问网络
 
 `/health` 不返回账户、节点或配置内容。
+
+## Docker 部署
+
+适用于 Linux 主机、NAS 和家用服务器，支持 `linux/amd64` 与 `linux/arm64`。需要 Docker Engine 和 Docker Compose。
+
+镜像：[`ghcr.io/soffchen/oixproxy:latest`](https://github.com/soffchen/oixproxy/pkgs/container/oixproxy)
+
+下载仓库后进入目录：
+
+```bash
+git clone https://github.com/soffchen/oixproxy.git
+cd oixproxy
+cp config.example.json config.json
+chmod 600 config.json
+```
+
+编辑 `config.json`：填入 `accessToken`；建议设置 `lanAuth`，不需要鉴权时保持 `null`。
+
+```bash
+docker compose up -d
+docker compose ps
+curl -f http://127.0.0.1:6172/health
+```
+
+健康状态应显示 `healthy`。同一局域网设备使用 Docker 主机 IP：
+
+```text
+完整配置    http://用户名:密码@Docker主机IP:6172/
+节点列表    http://用户名:密码@Docker主机IP:6172/list
+Clash       http://用户名:密码@Docker主机IP:6172/clash
+```
+
+未配置 `lanAuth` 时删除 URL 中的 `用户名:密码@`。这些 URL 使用 HTTP，必须由防火墙限制在可信局域网内，禁止直接暴露公网。
+
+| 项目 | 用途 |
+|---|---|
+| `config.json` | 账户与运行配置，只读挂载到 `/config/config.json` |
+| `oixproxy-data` | 身份密钥与 `OpenSurge.yaml` |
+| `6172/tcp` | 配置、节点列表和健康检查 |
+| `7200-7299/tcp` | 默认节点映射端口 |
+
+节点超过 100 个或使用范围外的固定端口时，扩大 `compose.yaml` 的端口范围。镜像以非 root 运行，根文件系统只读，并移除所有 Linux capabilities。
+
+Compose 固定使用 `latest`，以后无需修改版本号：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+停止：
+
+```bash
+docker compose down
+```
+
+同时删除持久数据：
+
+```bash
+docker compose down -v
+```
 
 ## 接入 Surge
 
@@ -253,4 +314,5 @@ OIX_LIVE_SOCKS=1 OIX_PROFILE=/path/to/your-dedicated.yaml go test ./internal/run
 
 ```bash
 go build -o oixproxy ./cmd/oixproxy
+docker build -t oixproxy .
 ```
