@@ -7,10 +7,15 @@ proxies:
     psk: "replace-me"
     version: 4
     reuse: true
+    udp: true
+    tfo: true
+    identity: true
     obfs-opts:
       mode: ech-tls
       alpn: snell-ech/1
       identity-version: 2
+      legacy-fallback: false
+      preconnect: 2
       sni: example.com
       path: /ws-tunnel-example
       ech-config: "AA=="

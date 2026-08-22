@@ -31,7 +31,7 @@ func TestSOCKS5CONNECTInvokesHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go AcceptLoop(ln, "", "", h)
+	go AcceptLoop(ln, "", "", h, nil)
 
 	c, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {

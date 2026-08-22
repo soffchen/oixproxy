@@ -16,18 +16,21 @@ import (
 // Handler dials the upstream for a TCP target.
 type Handler func(network, host string, port uint16) (net.Conn, error)
 
+// UDPDialer opens a snell UDP session. Nil means UDP ASSOCIATE is rejected.
+type UDPDialer func() (net.PacketConn, error)
+
 // ListenMixed accepts SOCKS5 and HTTP proxy on the same port.
-func ListenMixed(addr string, user, pass string, h Handler) (net.Listener, error) {
+func ListenMixed(addr string, user, pass string, h Handler, udp UDPDialer) (net.Listener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	go AcceptLoop(ln, user, pass, h)
+	go AcceptLoop(ln, user, pass, h, udp)
 	return ln, nil
 }
 
 // AcceptLoop serves mixed SOCKS5/HTTP on ln until it is closed.
-func AcceptLoop(ln net.Listener, user, pass string, h Handler) {
+func AcceptLoop(ln net.Listener, user, pass string, h Handler, udp UDPDialer) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -35,29 +38,29 @@ func AcceptLoop(ln net.Listener, user, pass string, h Handler) {
 		}
 		go func() {
 			defer c.Close()
-			_ = Handle(c, user, pass, h)
+			_ = Handle(c, user, pass, h, udp)
 		}()
 	}
 }
 
 // Handle serves one mixed SOCKS5/HTTP client connection.
-func Handle(c net.Conn, user, pass string, h Handler) error {
-	return serve(c, user, pass, h)
+func Handle(c net.Conn, user, pass string, h Handler, udp UDPDialer) error {
+	return serve(c, user, pass, h, udp)
 }
 
-func serve(c net.Conn, user, pass string, h Handler) error {
+func serve(c net.Conn, user, pass string, h Handler, udp UDPDialer) error {
 	br := bufio.NewReader(c)
 	b, err := br.Peek(1)
 	if err != nil {
 		return err
 	}
 	if b[0] == 0x05 {
-		return serveSOCKS(br, c, user, pass, h)
+		return serveSOCKS(br, c, user, pass, h, udp)
 	}
 	return serveHTTP(br, c, user, pass, h)
 }
 
-func serveSOCKS(br *bufio.Reader, c net.Conn, user, pass string, h Handler) error {
+func serveSOCKS(br *bufio.Reader, c net.Conn, user, pass string, h Handler, udp UDPDialer) error {
 	var hdr [2]byte
 	if _, err := io.ReadFull(br, hdr[:]); err != nil {
 		return err
@@ -117,7 +120,17 @@ func serveSOCKS(br *bufio.Reader, c net.Conn, user, pass string, h Handler) erro
 	if _, err := io.ReadFull(br, req[:]); err != nil {
 		return err
 	}
-	if req[0] != 0x05 || req[1] != 0x01 {
+	if req[0] != 0x05 {
+		return fmt.Errorf("socks version %d", req[0])
+	}
+	if req[1] == 0x03 {
+		_, _, err := readSOCKSAddr(br, req[3])
+		if err != nil {
+			return err
+		}
+		return serveUDPAssociate(c, br, udp)
+	}
+	if req[1] != 0x01 {
 		_, _ = c.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return fmt.Errorf("socks command %d", req[1])
 	}

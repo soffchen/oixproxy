@@ -20,7 +20,9 @@ import (
 type Mapping struct {
 	Node dialer.Node
 	Port int
-	ln   net.Listener
+	// UDP is ASSOCIATE + profile advertise for this listener (loopback bind only).
+	UDP bool
+	ln  net.Listener
 }
 
 type DialFunc func(ctx context.Context, n dialer.Node, network, host string, port uint16) (net.Conn, error)
@@ -44,10 +46,12 @@ type Server struct {
 	ProcessName   string
 	ProcessPath   string
 
-	mu      sync.Mutex
-	maps    []Mapping
-	httpLn  net.Listener
-	httpSrv *http.Server
+	mu         sync.Mutex
+	maps       []Mapping
+	pools      []*dialer.Pool
+	poolByName map[string]*dialer.Pool
+	httpLn     net.Listener
+	httpSrv    *http.Server
 }
 
 func (s *Server) Mappings() []Mapping {
@@ -65,43 +69,44 @@ func (s *Server) Start() error {
 	if s.BasePort == 0 {
 		s.BasePort = 7200
 	}
-	dial := s.Dial
-	if dial == nil {
-		dial = dialer.Dial
-	}
 	s.maps = make([]Mapping, 0, len(s.Nodes))
 	for i, n := range s.Nodes {
 		port := s.BasePort + i
 		node := n
+		dial := s.dialerFor(node)
 		h := func(network, host string, portu uint16) (net.Conn, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			return dial(ctx, node, network, host, portu)
 		}
 		addr := net.JoinHostPort(s.Bind, strconv.Itoa(port))
-		ln, err := inbound.ListenMixed(addr, s.User, s.Pass, h)
+		udp := s.udpDialer(node, s.Bind)
+		ln, err := inbound.ListenMixed(addr, s.User, s.Pass, h, udp)
 		if err != nil {
 			s.Close()
 			return fmt.Errorf("listen %s: %w", addr, err)
 		}
-		s.maps = append(s.maps, Mapping{Node: n, Port: port, ln: ln})
+		s.maps = append(s.maps, Mapping{Node: n, Port: port, UDP: listenUDP(s.Bind, n.UDP), ln: ln})
 		log.Printf("mapped %s -> %s", n.Name, addr)
 	}
 	for _, extra := range s.Extras {
 		node := extra.Node
+		dial := s.dialerFor(node)
 		h := func(network, host string, portu uint16) (net.Conn, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			return dial(ctx, node, network, host, portu)
 		}
-		ln, err := inbound.ListenMixed(extra.Addr, s.User, s.Pass, h)
+		extraHost, _, _ := net.SplitHostPort(extra.Addr)
+		udp := s.udpDialer(node, extraHost)
+		ln, err := inbound.ListenMixed(extra.Addr, s.User, s.Pass, h, udp)
 		if err != nil {
 			s.Close()
 			return fmt.Errorf("listen %s: %w", extra.Addr, err)
 		}
 		_, ps, _ := net.SplitHostPort(extra.Addr)
 		port, _ := strconv.Atoi(ps)
-		s.maps = append(s.maps, Mapping{Node: extra.Node, Port: port, ln: ln})
+		s.maps = append(s.maps, Mapping{Node: extra.Node, Port: port, UDP: listenUDP(extraHost, extra.Node.UDP), ln: ln})
 		log.Printf("mapped %s -> %s", extra.Node.Name, extra.Addr)
 	}
 
@@ -139,6 +144,38 @@ func (s *Server) Start() error {
 		}
 	}()
 	return nil
+}
+
+func (s *Server) dialerFor(n dialer.Node) DialFunc {
+	if s.Dial != nil {
+		return s.Dial
+	}
+	if !n.Reuse && n.Preconnect <= 0 {
+		return dialer.Dial
+	}
+	if s.poolByName == nil {
+		s.poolByName = map[string]*dialer.Pool{}
+	}
+	if p := s.poolByName[n.Name]; p != nil {
+		return p.Dial
+	}
+	p := dialer.NewPool(n)
+	s.poolByName[n.Name] = p
+	s.pools = append(s.pools, p)
+	p.Warm(n.Preconnect)
+	return p.Dial
+}
+
+func (s *Server) udpDialer(n dialer.Node, listenHost string) inbound.UDPDialer {
+	if s.Dial != nil || !listenUDP(listenHost, n.UDP) {
+		return nil
+	}
+	node := n
+	return func() (net.PacketConn, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		return dialer.ListenPacket(ctx, node)
+	}
 }
 
 func (s *Server) processName() string {
@@ -183,6 +220,11 @@ func (s *Server) Close() {
 			_ = m.ln.Close()
 		}
 	}
+	for _, p := range s.pools {
+		p.Close()
+	}
+	s.pools = nil
+	s.poolByName = nil
 }
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {

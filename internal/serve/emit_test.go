@@ -97,8 +97,13 @@ AdBlock = select, Block, Direct, Proxy
 	}
 }
 
-func TestLoopbackAddsUDPRelay(t *testing.T) {
+func TestUDPAdvertisedWhenEnabled(t *testing.T) {
 	maps := testMaps()
+	if strings.Contains(ProxyList(maps, "127.0.0.1"), "udp-relay") {
+		t.Fatal("udp off")
+	}
+	maps[0].UDP = true
+	maps[1].UDP = true
 	list := ProxyList(maps, "127.0.0.1")
 	if !strings.Contains(list, "udp-relay=true") {
 		t.Fatal(list)
@@ -107,8 +112,10 @@ func TestLoopbackAddsUDPRelay(t *testing.T) {
 	if !strings.Contains(clash, "udp: true") {
 		t.Fatal(clash)
 	}
-	lan := ProxyList(maps, "203.0.113.10")
-	if strings.Contains(lan, "udp-relay") {
-		t.Fatal(lan)
+	if strings.Contains(ProxyList(maps, "203.0.113.10"), "udp-relay") {
+		t.Fatal("non-loopback must not advertise udp")
+	}
+	if strings.Contains(ClashConfig(maps, "203.0.113.10"), "udp: true") {
+		t.Fatal("non-loopback clash must not advertise udp")
 	}
 }

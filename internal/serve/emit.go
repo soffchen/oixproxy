@@ -18,16 +18,23 @@ func isLoopbackHost(host string) bool {
 	return false
 }
 
-func socksLine(name, host string, port int, loopback bool) string {
-	if loopback {
+func socksLine(name, host string, port int, udp bool) string {
+	if udp {
 		return fmt.Sprintf("%s = socks5, %s, %d, udp-relay=true", name, host, port)
 	}
 	return fmt.Sprintf("%s = socks5, %s, %d", name, host, port)
 }
 
+func listenUDP(bind string, nodeUDP bool) bool {
+	return nodeUDP && isLoopbackHost(bind)
+}
+
+func advertiseUDP(host string, m Mapping) bool {
+	return m.UDP && isLoopbackHost(host)
+}
+
 // ClashConfig is the official /clash provider: socks5 proxies only.
 func ClashConfig(maps []Mapping, host string) string {
-	loopback := isLoopbackHost(host)
 	var b strings.Builder
 	b.WriteString("proxies:\n")
 	for _, m := range maps {
@@ -35,7 +42,7 @@ func ClashConfig(maps []Mapping, host string) string {
 		b.WriteString("    type: socks5\n")
 		fmt.Fprintf(&b, "    server: %s\n", host)
 		fmt.Fprintf(&b, "    port: %d\n", m.Port)
-		if loopback {
+		if advertiseUDP(host, m) {
 			b.WriteString("    udp: true\n")
 		}
 	}
@@ -44,10 +51,9 @@ func ClashConfig(maps []Mapping, host string) string {
 
 // ProxyList is the official /list Surge policy-path body.
 func ProxyList(maps []Mapping, host string) string {
-	loopback := isLoopbackHost(host)
 	var b strings.Builder
 	for _, m := range maps {
-		b.WriteString(socksLine(m.Node.Name, host, m.Port, loopback))
+		b.WriteString(socksLine(m.Node.Name, host, m.Port, advertiseUDP(host, m)))
 		b.WriteByte('\n')
 	}
 	return b.String()
@@ -69,7 +75,6 @@ func looksLikeSurge(b []byte) bool {
 }
 
 func minimalSurge(maps []Mapping, listenURL, host string) string {
-	loopback := isLoopbackHost(host)
 	var b strings.Builder
 	fmt.Fprintf(&b, "#!MANAGED-CONFIG %s interval=86400 strict=false\n\n", listenURL)
 	b.WriteString("[General]\n")
@@ -81,7 +86,7 @@ func minimalSurge(maps []Mapping, listenURL, host string) string {
 	b.WriteString("Block = reject\n\n")
 	var names []string
 	for _, m := range maps {
-		b.WriteString(socksLine(m.Node.Name, host, m.Port, loopback))
+		b.WriteString(socksLine(m.Node.Name, host, m.Port, advertiseUDP(host, m)))
 		b.WriteByte('\n')
 		names = append(names, m.Node.Name)
 	}
@@ -100,7 +105,6 @@ func minimalSurge(maps []Mapping, listenURL, host string) string {
 // RewriteSurge converts a helper/public Surge template into the official
 // client-facing profile: local socks5 only, no snell/anytls/psk/ech.
 func RewriteSurge(template []byte, maps []Mapping, listenURL, host string) string {
-	loopback := isLoopbackHost(host)
 	lines := strings.Split(string(template), "\n")
 	var out []string
 	section := ""
@@ -147,7 +151,7 @@ func RewriteSurge(template []byte, maps []Mapping, listenURL, host string) strin
 					out = append(out, "")
 				}
 				for _, m := range maps {
-					out = append(out, socksLine(m.Node.Name, host, m.Port, loopback))
+					out = append(out, socksLine(m.Node.Name, host, m.Port, advertiseUDP(host, m)))
 				}
 				wroteProxy = true
 			}
@@ -170,7 +174,7 @@ func RewriteSurge(template []byte, maps []Mapping, listenURL, host string) strin
 		// template had no [Proxy]; append one
 		out = append(out, "", "[Proxy]", "Direct = direct", "Block = reject")
 		for _, m := range maps {
-			out = append(out, socksLine(m.Node.Name, host, m.Port, loopback))
+			out = append(out, socksLine(m.Node.Name, host, m.Port, advertiseUDP(host, m)))
 		}
 	}
 	body := strings.Join(out, "\n")

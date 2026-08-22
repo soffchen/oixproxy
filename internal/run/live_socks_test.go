@@ -203,3 +203,144 @@ func TestLiveMappedSOCKSReachesGoogle(t *testing.T) {
 		t.Fatalf("unexpected google line %q", line)
 	}
 }
+
+func TestLiveTFODialReachesGoogle(t *testing.T) {
+	n := liveNodes(t)[0]
+	n.TFO = true
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := dialer.Dial(ctx, n, "tcp", "www.google.com", 443)
+	if err != nil {
+		t.Fatalf("tfo dial: %v", err)
+	}
+	defer c.Close()
+	tc := tls.Client(c, &tls.Config{ServerName: "www.google.com", MinVersion: tls.VersionTLS12})
+	if err := tc.Handshake(); err != nil {
+		t.Fatalf("tls over tfo snell: %v", err)
+	}
+	if _, err := io.WriteString(tc, "GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 80)
+	nread, err := tc.Read(buf)
+	if nread == 0 {
+		t.Fatalf("empty google response: %v", err)
+	}
+	line := strings.Split(string(buf[:nread]), "\r\n")[0]
+	t.Logf("google via tfo snell: %q", line)
+	if !strings.HasPrefix(line, "HTTP/") {
+		t.Fatalf("not http: %q", line)
+	}
+}
+
+func TestLiveUDPPacketDNS(t *testing.T) {
+	n := liveNodes(t)[0]
+	n.UDP = true
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pc, err := dialer.ListenPacket(ctx, n)
+	if err != nil {
+		t.Fatalf("listen packet: %v", err)
+	}
+	defer pc.Close()
+	_ = pc.SetDeadline(time.Now().Add(12 * time.Second))
+	q := dnsQueryA("www.google.com")
+	if _, err := pc.WriteTo(q, &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 53}); err != nil {
+		t.Fatalf("udp write: %v", err)
+	}
+	buf := make([]byte, 1500)
+	nread, addr, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("udp read: %v", err)
+	}
+	if nread < 12 {
+		t.Fatalf("short dns %d from %v", nread, addr)
+	}
+	t.Logf("dns via snell udp: %d bytes from %v", nread, addr)
+}
+
+func TestLiveMappedSOCKSUDPAssociate(t *testing.T) {
+	nodes := liveNodes(t)
+	n0 := nodes[0]
+	n0.UDP = true
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpPort := httpLn.Addr().(*net.TCPAddr).Port
+	_ = httpLn.Close()
+	mapLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapPort := mapLn.Addr().(*net.TCPAddr).Port
+	_ = mapLn.Close()
+
+	s := &serve.Server{
+		Listen:   net.JoinHostPort("127.0.0.1", strconv.Itoa(httpPort)),
+		Bind:     "127.0.0.1",
+		BasePort: mapPort,
+		Nodes:    []dialer.Node{n0},
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(mapPort)), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(20 * time.Second))
+	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	var greet [2]byte
+	if _, err := io.ReadFull(c, greet[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	rep := make([]byte, 10)
+	if _, err := io.ReadFull(c, rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep[1] != 0 {
+		t.Fatalf("associate reply %v", rep)
+	}
+	port := int(binary.BigEndian.Uint16(rep[8:10]))
+	uc, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uc.Close()
+	_ = uc.SetDeadline(time.Now().Add(12 * time.Second))
+	q := dnsQueryA("www.google.com")
+	pkt := []byte{0, 0, 0, 0x01, 8, 8, 8, 8, 0, 53}
+	pkt = append(pkt, q...)
+	if _, err := uc.Write(pkt); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 2048)
+	nread, err := uc.Read(buf)
+	if err != nil {
+		t.Fatalf("socks udp read: %v", err)
+	}
+	if nread < 10 {
+		t.Fatalf("short socks udp %d", nread)
+	}
+	t.Logf("dns via socks5 udp associate: %d bytes", nread)
+}
+
+func dnsQueryA(name string) []byte {
+	var q []byte
+	q = append(q, 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+	for _, lab := range strings.Split(name, ".") {
+		q = append(q, byte(len(lab)))
+		q = append(q, lab...)
+	}
+	q = append(q, 0x00, 0x00, 0x01, 0x00, 0x01)
+	return q
+}

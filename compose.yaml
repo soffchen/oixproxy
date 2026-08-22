@@ -14,6 +14,7 @@ services:
       - /tmp:rw,noexec,nosuid,size=16m
     ports:
       - "6172:6172/tcp"
+      # TCP only: SOCKS UDP ASSOCIATE is loopback-only (ephemeral BND is not published).
       - "7200-7299:7200-7299/tcp"
     volumes:
       # non-root image; host config.json must be 0644, not 0600

@@ -93,7 +93,7 @@ Clash       http://用户名:密码@Docker主机IP:6172/clash
 | `config.json` | 账户与运行配置，只读挂载到 `/config/config.json` |
 | `oixproxy-data` | 身份密钥与 `OpenSurge.yaml` |
 | `6172/tcp` | 配置、节点列表和健康检查 |
-| `7200-7299/tcp` | 默认节点映射端口 |
+| `7200-7299/tcp` | 默认节点映射端口（仅 TCP；SOCKS UDP 只在 `--bind 127.0.0.1` 时启用） |
 
 节点超过 100 个或使用范围外的固定端口时，扩大 `compose.yaml` 的端口范围。镜像以非 root 运行，根文件系统只读，并移除所有 Linux capabilities。
 
@@ -249,7 +249,7 @@ helper 必须先于 OpenSurge 启动。helper 退出时现有 OpenSurge 连接�
 | `/health` | `ok` |
 | `/` | 完整 Surge 托管配置（`#!MANAGED-CONFIG`） |
 | `/clash` | Clash / mihomo provider，`type: socks5` |
-| `/list` | Surge policy-path：`name = socks5, host, port`；环回带 `udp-relay=true` |
+| `/list` | Surge policy-path：`name = socks5, host, port`；本机 loopback 且节点 `udp: true` 时带 `udp-relay=true` |
 | `/opensurge` | OpenSurge 用的 mihomo overlay（只读检查，不要当 HTTPS 订阅源） |
 
 客户端产物里只有本地 socks5，没有远端节点地址、PSK、ECH。

@@ -12,6 +12,7 @@ import (
 	"math/bits"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/argon2"
@@ -40,6 +41,10 @@ const (
 	initialPadSpan   = 0x100
 )
 
+// ErrZeroChunk is a v4 empty payload: the peer half-closed a reused stream.
+// Conn.Read maps it to io.EOF and PeerClosed reports true, unlike a TLS drop.
+var ErrZeroChunk = errors.New("snell zero chunk")
+
 func kdf(psk, salt []byte) []byte {
 	return argon2.IDKey(psk, salt, 3, 8, 1, 32)[:16]
 }
@@ -62,6 +67,7 @@ type Conn struct {
 	r               *v4Reader
 	w               *v4Writer
 	reply           bool
+	peerClosed      atomic.Bool
 }
 
 func NewConn(raw net.Conn, psk, exporter []byte) *Conn {
@@ -111,7 +117,12 @@ func (c *Conn) Read(b []byte) (int, error) {
 			return 0, err
 		}
 	}
-	return c.r.Read(b)
+	n, err := c.r.Read(b)
+	if errors.Is(err, ErrZeroChunk) {
+		c.peerClosed.Store(true)
+		return n, io.EOF
+	}
+	return n, err
 }
 
 func (c *Conn) Write(b []byte) (int, error) {
@@ -155,6 +166,28 @@ func (c *Conn) ReadReply() error {
 	}
 }
 
+// HalfClose writes a v4 zero chunk so a reused session can take another CONNECT.
+func (c *Conn) HalfClose() error {
+	if c.w == nil {
+		if err := c.initWriter(); err != nil {
+			return err
+		}
+	}
+	_, err := c.w.Write(nil)
+	return err
+}
+
+// ResetReply lets the next CONNECT on a reused session wait for a new reply.
+func (c *Conn) ResetReply() {
+	c.reply = false
+	c.peerClosed.Store(false)
+}
+
+// PeerClosed reports a v4 zero-chunk half-close, not a TLS/TCP drop.
+func (c *Conn) PeerClosed() bool {
+	return c.peerClosed.Load()
+}
+
 // WriteConnect sends a TCP CONNECT (or reuse CONNECT-V2) request.
 func (c *Conn) WriteConnect(host string, port uint16, reuse bool) error {
 	if len(host) > 255 {
@@ -177,6 +210,44 @@ func (c *Conn) WriteConnect(host string, port uint16, reuse bool) error {
 func (c *Conn) WriteUDP() error {
 	_, err := c.Write([]byte{headerVersion, cmdUDP, 0})
 	return err
+}
+
+// WritePacket writes one UDP datagram as a single v4 frame.
+func (c *Conn) WritePacket(b []byte) (int, error) {
+	if len(b) > maxPayload {
+		return 0, errors.New("snell v4 frame too large")
+	}
+	if c.w == nil {
+		if err := c.initWriter(); err != nil {
+			return 0, err
+		}
+	}
+	return c.w.writePacketFrame(b)
+}
+
+// ReadPacket returns one complete v4 payload (one UDP datagram after the reply).
+func (c *Conn) ReadPacket() ([]byte, error) {
+	if err := c.ReadReply(); err != nil {
+		return nil, err
+	}
+	if c.r == nil {
+		if err := c.initReader(); err != nil {
+			return nil, err
+		}
+	}
+	c.r.mu.Lock()
+	defer c.r.mu.Unlock()
+	if len(c.r.buf) > 0 {
+		p := c.r.buf
+		c.r.buf = nil
+		return p, nil
+	}
+	p, err := c.r.readFrame()
+	if errors.Is(err, ErrZeroChunk) {
+		c.peerClosed.Store(true)
+		return nil, io.EOF
+	}
+	return p, err
 }
 
 type v4Reader struct {
@@ -221,7 +292,7 @@ func (r *v4Reader) readFrame() ([]byte, error) {
 		if padLen != 0 {
 			return nil, errors.New("snell v4 zero chunk with padding")
 		}
-		return nil, io.EOF
+		return nil, ErrZeroChunk
 	}
 	if payLen > maxPayload || padLen > maxPayload {
 		return nil, errors.New("snell v4 frame too large")
@@ -275,6 +346,19 @@ func newWriter(w io.Writer, psk, exporter []byte, identityVersion int) (*v4Write
 		identityVersion: identityVersion,
 		initPad:         uint16(initialPadMin + delta),
 	}, nil
+}
+
+func (w *v4Writer) writePacketFrame(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	pad := 0
+	if !w.saltSent && len(b) > 0 {
+		pad = int(w.initPad)
+	}
+	if err := w.writeFrame(b, pad); err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 func (w *v4Writer) Write(b []byte) (int, error) {

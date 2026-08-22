@@ -11,7 +11,7 @@ func TestParseFlowStyle(t *testing.T) {
 	p := filepath.Join(dir, "n.yaml")
 	yaml := `
 proxies:
-  - { name: "hk 01", type: snell, server: hk.example, port: 14888, psk: test-psk, version: 4, reuse: true, identity: true, obfs-opts: { mode: ech-tls, alpn: snell-ech/1, sni: cover.example, ech-config: AAAA, path: /ws-tunnel-test, identity-version: 2, skip-cert-verify: false } }
+  - { name: "hk 01", type: snell, server: hk.example, port: 14888, psk: test-psk, version: 4, reuse: true, udp: true, tfo: true, identity: true, obfs-opts: { mode: ech-tls, alpn: snell-ech/1, sni: cover.example, ech-config: AAAA, path: /ws-tunnel-test, identity-version: 2, legacy-fallback: false, preconnect: 2, skip-cert-verify: false } }
   - { name: "ss 01", type: ss, server: x, port: 1 }
 `
 	if err := os.WriteFile(p, []byte(yaml), 0o600); err != nil {
@@ -27,6 +27,9 @@ proxies:
 	n := nodes[0]
 	if n.Name != "hk 01" || n.Port != 14888 || n.PSK != "test-psk" || n.ALPN != "snell-ech/1" || n.ECHConfig != "AAAA" || n.Path != "/ws-tunnel-test" || n.IdentityVersion != 2 {
 		t.Fatalf("%+v", n)
+	}
+	if !n.Reuse || !n.TFO || !n.UDP || n.LegacyFallback || n.Preconnect != 2 {
+		t.Fatalf("flclash fields %+v", n)
 	}
 }
 
@@ -57,6 +60,28 @@ proxies:
 	}
 	if nodes[0].DNS[1].Addr != "124.221.68.73:1053" || nodes[0].DNS[1].Network != "tcp" {
 		t.Fatalf("tcp server %+v", nodes[0].DNS[1])
+	}
+	if !nodes[0].LegacyFallback {
+		t.Fatal("omitted legacy-fallback should default true")
+	}
+}
+
+func TestParseSurgeLegacyFallbackDefault(t *testing.T) {
+	nodes, err := Parse([]byte(`[Proxy]
+hk = snell, hk.example, 14888, psk=test-psk, obfs=ech-tls, ech-config=AAAA, obfs-host=cover.example
+jp = snell, jp.example, 14888, psk=test-psk, obfs=ech-tls, ech-config=AAAA, obfs-host=cover.example, legacy-fallback=false
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("nodes %d", len(nodes))
+	}
+	if !nodes[0].LegacyFallback {
+		t.Fatal("omitted surge legacy-fallback should default true")
+	}
+	if nodes[1].LegacyFallback {
+		t.Fatal("explicit false must stay false")
 	}
 }
 

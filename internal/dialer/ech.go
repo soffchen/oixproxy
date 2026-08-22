@@ -27,6 +27,14 @@ type Node struct {
 	IdentityVersion int
 	SkipVerify      bool
 	Reuse           bool
+	TFO             bool
+	UDP             bool
+	// LegacyFallback retries ALPN http/1.1 + websocket if the first ECH
+	// handshake fails. Profile parse defaults omitted to true; explicit
+	// false matches FlClash dedicated nodes.
+	LegacyFallback bool
+	// Preconnect is idle snell transports to keep ready (FlClash obfs-opts, 0–4).
+	Preconnect int
 	// DNS is nameservers from the dedicated YAML for this hostname.
 	DNS []DNSServer
 	// DialIP skips DNS when set (tests only).
@@ -98,7 +106,7 @@ func Dial(ctx context.Context, n Node, network, host string, port uint16) (net.C
 
 func dialTransport(ctx context.Context, n Node) (net.Conn, []byte, error) {
 	conn, st, err := handshakeUTLSRaw(ctx, n, []string{n.alpn()}, false)
-	if err != nil && n.Path != "" && n.alpn() != "http/1.1" {
+	if err != nil && n.LegacyFallback && n.Path != "" && n.alpn() != "http/1.1" {
 		conn, st, err = handshakeUTLSRaw(ctx, n, []string{"http/1.1"}, true)
 	}
 	if err != nil {
@@ -143,13 +151,16 @@ func needsPrivateDNS(host string) bool {
 }
 
 func dialTCP(ctx context.Context, n Node) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 15 * time.Second}
+	d := net.Dialer{Timeout: 15 * time.Second}
 	if deadline, ok := ctx.Deadline(); ok {
 		d.Deadline = deadline
 	}
 	dests, err := Destinations(ctx, n)
 	if err != nil {
 		return nil, err
+	}
+	if n.TFO {
+		return newTFOConn(ctx, dests, d), nil
 	}
 	var last error
 	for _, dest := range dests {
