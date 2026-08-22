@@ -25,16 +25,15 @@ type Pool struct {
 	node    Node
 	factory func(context.Context) (*snell.Conn, error)
 
-	mu       sync.Mutex
-	idle     []idleConn
-	closed   bool
-	warming  int
-	warmCond *sync.Cond
+	mu      sync.Mutex
+	idle    []idleConn
+	closed  bool
+	warming int
+	waiters []chan struct{}
 }
 
 func NewPool(n Node) *Pool {
 	p := &Pool{node: n}
-	p.warmCond = sync.NewCond(&p.mu)
 	p.factory = func(ctx context.Context) (*snell.Conn, error) {
 		raw, exporter, err := dialTransport(ctx, n)
 		if err != nil {
@@ -57,7 +56,9 @@ func (p *Pool) Warm(n int) {
 			defer func() {
 				p.mu.Lock()
 				p.warming--
-				p.warmCond.Broadcast()
+				if p.warming == 0 || len(p.idle) > 0 {
+					p.notifyWaitersLocked()
+				}
 				p.mu.Unlock()
 			}()
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -95,9 +96,7 @@ func (p *Pool) Close() {
 	p.closed = true
 	idle := p.idle
 	p.idle = nil
-	if p.warmCond != nil {
-		p.warmCond.Broadcast()
-	}
+	p.notifyWaitersLocked()
 	p.mu.Unlock()
 	for _, it := range idle {
 		_ = it.c.Close()
@@ -112,6 +111,9 @@ func (p *Pool) take(ctx context.Context) (*snell.Conn, error) {
 	if c := p.pop(); c != nil {
 		return c, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return p.factory(ctx)
 }
 
@@ -121,23 +123,30 @@ func (p *Pool) waitWarm(ctx context.Context) {
 		p.mu.Unlock()
 		return
 	}
+	ch := make(chan struct{})
+	p.waiters = append(p.waiters, ch)
 	p.mu.Unlock()
-	done := make(chan struct{})
-	go func() {
-		p.mu.Lock()
-		for p.warming > 0 && len(p.idle) == 0 && !p.closed {
-			p.warmCond.Wait()
-		}
-		p.mu.Unlock()
-		close(done)
-	}()
 	select {
-	case <-done:
+	case <-ch:
 	case <-ctx.Done():
 		p.mu.Lock()
-		p.warmCond.Broadcast()
+		n := 0
+		for _, w := range p.waiters {
+			if w != ch {
+				p.waiters[n] = w
+				n++
+			}
+		}
+		p.waiters = p.waiters[:n]
 		p.mu.Unlock()
 	}
+}
+
+func (p *Pool) notifyWaitersLocked() {
+	for _, ch := range p.waiters {
+		close(ch)
+	}
+	p.waiters = nil
 }
 
 func (p *Pool) pop() *snell.Conn {
@@ -163,7 +172,7 @@ func (p *Pool) put(c *snell.Conn) bool {
 		return false
 	}
 	p.idle = append(p.idle, idleConn{c: c, used: time.Now()})
-	p.warmCond.Broadcast()
+	p.notifyWaitersLocked()
 	return true
 }
 

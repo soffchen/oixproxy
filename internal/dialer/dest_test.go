@@ -263,6 +263,51 @@ func serveTCPDNS(c net.Conn, ip net.IP) {
 	_, _ = c.Write(append(ln[:], resp...))
 }
 
+func TestLookupSingleflightIgnoresLeaderCancel(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				time.Sleep(600 * time.Millisecond)
+				serveTCPDNS(c, net.ParseIP("198.51.100.30"))
+			}(c)
+		}
+	}()
+	n := Node{
+		Server: "sf-leader.example",
+		Port:   14888,
+		DNS:    []DNSServer{{Network: "tcp", Addr: ln.Addr().String()}},
+	}
+	short, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		_, err := Destinations(short, n)
+		errc <- err
+	}()
+	time.Sleep(40 * time.Millisecond)
+	long, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	dests, err := Destinations(long, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dests[0] != "198.51.100.30:14888" {
+		t.Fatalf("%v", dests)
+	}
+	if err := <-errc; err == nil {
+		t.Fatal("short leader ctx should fail")
+	}
+}
+
 func TestLookupLiteralIP(t *testing.T) {
 	ctx := context.Background()
 	ips, err := Lookup(ctx, "192.0.2.8")

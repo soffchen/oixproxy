@@ -117,27 +117,35 @@ func LookupServers(ctx context.Context, host string, servers []DNSServer) ([]net
 	dnsSFMu.Lock()
 	if call := dnsSF[ck]; call != nil {
 		dnsSFMu.Unlock()
-		select {
-		case <-call.done:
-			if len(call.ips) > 0 {
-				return cloneIPs(call.ips), call.err
-			}
-			return nil, call.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+		return waitDNSCall(ctx, call)
 	}
 	call := &dnsSFCall{done: make(chan struct{})}
 	dnsSF[ck] = call
 	dnsSFMu.Unlock()
 
-	ips, err := lookupServersUncached(ctx, host, servers)
-	call.ips, call.err = ips, err
-	close(call.done)
-	dnsSFMu.Lock()
-	delete(dnsSF, ck)
-	dnsSFMu.Unlock()
-	return ips, err
+	go func() {
+		lookupCtx, cancel := context.WithTimeout(context.Background(), tcpDNSTimeout)
+		defer cancel()
+		ips, err := lookupServersUncached(lookupCtx, host, servers)
+		call.ips, call.err = ips, err
+		close(call.done)
+		dnsSFMu.Lock()
+		delete(dnsSF, ck)
+		dnsSFMu.Unlock()
+	}()
+	return waitDNSCall(ctx, call)
+}
+
+func waitDNSCall(ctx context.Context, call *dnsSFCall) ([]net.IP, error) {
+	select {
+	case <-call.done:
+		if len(call.ips) > 0 {
+			return cloneIPs(call.ips), call.err
+		}
+		return nil, call.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func cloneIPs(ips []net.IP) []net.IP {
