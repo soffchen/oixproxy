@@ -20,7 +20,7 @@ import (
 type Mapping struct {
 	Node dialer.Node
 	Port int
-	// UDP is ASSOCIATE + profile advertise for this listener (loopback bind only).
+	// UDP is ASSOCIATE + profile advertise for this listener.
 	UDP bool
 	ln  net.Listener
 }
@@ -80,13 +80,13 @@ func (s *Server) Start() error {
 			return dial(ctx, node, network, host, portu)
 		}
 		addr := net.JoinHostPort(s.Bind, strconv.Itoa(port))
-		udp := s.udpDialer(node, s.Bind)
+		udp := s.udpDialer(node)
 		ln, err := inbound.ListenMixed(addr, s.User, s.Pass, h, udp)
 		if err != nil {
 			s.Close()
 			return fmt.Errorf("listen %s: %w", addr, err)
 		}
-		s.maps = append(s.maps, Mapping{Node: n, Port: port, UDP: listenUDP(s.Bind, n.UDP), ln: ln})
+		s.maps = append(s.maps, Mapping{Node: n, Port: port, UDP: udp != nil, ln: ln})
 		log.Printf("mapped %s -> %s", n.Name, addr)
 	}
 	for _, extra := range s.Extras {
@@ -97,8 +97,7 @@ func (s *Server) Start() error {
 			defer cancel()
 			return dial(ctx, node, network, host, portu)
 		}
-		extraHost, _, _ := net.SplitHostPort(extra.Addr)
-		udp := s.udpDialer(node, extraHost)
+		udp := s.udpDialer(node)
 		ln, err := inbound.ListenMixed(extra.Addr, s.User, s.Pass, h, udp)
 		if err != nil {
 			s.Close()
@@ -106,7 +105,7 @@ func (s *Server) Start() error {
 		}
 		_, ps, _ := net.SplitHostPort(extra.Addr)
 		port, _ := strconv.Atoi(ps)
-		s.maps = append(s.maps, Mapping{Node: extra.Node, Port: port, UDP: listenUDP(extraHost, extra.Node.UDP), ln: ln})
+		s.maps = append(s.maps, Mapping{Node: extra.Node, Port: port, UDP: udp != nil, ln: ln})
 		log.Printf("mapped %s -> %s", extra.Node.Name, extra.Addr)
 	}
 
@@ -166,8 +165,8 @@ func (s *Server) dialerFor(n dialer.Node) DialFunc {
 	return p.Dial
 }
 
-func (s *Server) udpDialer(n dialer.Node, listenHost string) inbound.UDPDialer {
-	if s.Dial != nil || !listenUDP(listenHost, n.UDP) {
+func (s *Server) udpDialer(n dialer.Node) inbound.UDPDialer {
+	if s.Dial != nil || !n.UDP {
 		return nil
 	}
 	node := n

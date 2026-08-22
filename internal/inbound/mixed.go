@@ -19,18 +19,51 @@ type Handler func(network, host string, port uint16) (net.Conn, error)
 // UDPDialer opens a snell UDP session. Nil means UDP ASSOCIATE is rejected.
 type UDPDialer func() (net.PacketConn, error)
 
+type mixedListener struct {
+	net.Listener
+	hub *udpHub
+}
+
+func (m *mixedListener) Close() error {
+	err := m.Listener.Close()
+	if m.hub != nil {
+		if e := m.hub.Close(); err == nil {
+			err = e
+		}
+	}
+	return err
+}
+
+func listenerHub(ln net.Listener) *udpHub {
+	if m, ok := ln.(*mixedListener); ok {
+		return m.hub
+	}
+	return nil
+}
+
 // ListenMixed accepts SOCKS5 and HTTP proxy on the same port.
+// When udp is set, SOCKS UDP ASSOCIATE binds the same host:port as TCP.
 func ListenMixed(addr string, user, pass string, h Handler, udp UDPDialer) (net.Listener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	go AcceptLoop(ln, user, pass, h, udp)
-	return ln, nil
+	ml := &mixedListener{Listener: ln}
+	if udp != nil {
+		pc, err := listenPacketSame(ln.Addr().String())
+		if err != nil {
+			_ = ln.Close()
+			return nil, err
+		}
+		ml.hub = newUDPHub(pc)
+	}
+	go AcceptLoop(ml, user, pass, h, udp)
+	return ml, nil
 }
 
 // AcceptLoop serves mixed SOCKS5/HTTP on ln until it is closed.
 func AcceptLoop(ln net.Listener, user, pass string, h Handler, udp UDPDialer) {
+	hub := listenerHub(ln)
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -38,29 +71,29 @@ func AcceptLoop(ln net.Listener, user, pass string, h Handler, udp UDPDialer) {
 		}
 		go func() {
 			defer c.Close()
-			_ = Handle(c, user, pass, h, udp)
+			_ = serve(c, user, pass, h, udp, hub)
 		}()
 	}
 }
 
 // Handle serves one mixed SOCKS5/HTTP client connection.
 func Handle(c net.Conn, user, pass string, h Handler, udp UDPDialer) error {
-	return serve(c, user, pass, h, udp)
+	return serve(c, user, pass, h, udp, nil)
 }
 
-func serve(c net.Conn, user, pass string, h Handler, udp UDPDialer) error {
+func serve(c net.Conn, user, pass string, h Handler, udp UDPDialer, hub *udpHub) error {
 	br := bufio.NewReader(c)
 	b, err := br.Peek(1)
 	if err != nil {
 		return err
 	}
 	if b[0] == 0x05 {
-		return serveSOCKS(br, c, user, pass, h, udp)
+		return serveSOCKS(br, c, user, pass, h, udp, hub)
 	}
 	return serveHTTP(br, c, user, pass, h)
 }
 
-func serveSOCKS(br *bufio.Reader, c net.Conn, user, pass string, h Handler, udp UDPDialer) error {
+func serveSOCKS(br *bufio.Reader, c net.Conn, user, pass string, h Handler, udp UDPDialer, hub *udpHub) error {
 	var hdr [2]byte
 	if _, err := io.ReadFull(br, hdr[:]); err != nil {
 		return err
@@ -128,7 +161,7 @@ func serveSOCKS(br *bufio.Reader, c net.Conn, user, pass string, h Handler, udp 
 		if err != nil {
 			return err
 		}
-		return serveUDPAssociate(c, br, udp)
+		return serveUDPAssociate(c, br, udp, hub)
 	}
 	if req[1] != 0x01 {
 		_, _ = c.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})

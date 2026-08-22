@@ -112,10 +112,11 @@ func TestUDPAdvertisedWhenEnabled(t *testing.T) {
 	if !strings.Contains(clash, "udp: true") {
 		t.Fatal(clash)
 	}
-	if strings.Contains(ProxyList(maps, "203.0.113.10"), "udp-relay") {
-		t.Fatal("non-loopback must not advertise udp")
+	listLAN := ProxyList(maps, "203.0.113.10")
+	if !strings.Contains(listLAN, "udp-relay=true") {
+		t.Fatal(listLAN)
 	}
-	if strings.Contains(ClashConfig(maps, "203.0.113.10"), "udp: true") {
-		t.Fatal("non-loopback clash must not advertise udp")
+	if !strings.Contains(ClashConfig(maps, "203.0.113.10"), "udp: true") {
+		t.Fatal("lan clash should advertise udp")
 	}
 }

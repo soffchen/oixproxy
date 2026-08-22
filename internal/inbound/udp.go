@@ -7,11 +7,10 @@ import (
 	"io"
 	"net"
 	"strconv"
-	"sync"
 )
 
-func serveUDPAssociate(tcp net.Conn, br *bufio.Reader, udp UDPDialer) error {
-	if udp == nil || !udpLocalOK(tcp.LocalAddr()) {
+func serveUDPAssociate(tcp net.Conn, br *bufio.Reader, udp UDPDialer, hub *udpHub) error {
+	if udp == nil || hub == nil {
 		_, _ = tcp.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return fmt.Errorf("socks udp not enabled")
 	}
@@ -22,97 +21,44 @@ func serveUDPAssociate(tcp net.Conn, br *bufio.Reader, udp UDPDialer) error {
 	}
 	defer up.Close()
 
-	localIP := net.IPv4(127, 0, 0, 1)
-	if ta, ok := tcp.LocalAddr().(*net.TCPAddr); ok && ta.IP != nil {
-		localIP = ta.IP
-	}
-	network := "udp"
-	if localIP.To4() != nil {
-		network = "udp4"
-	} else if localIP.To16() != nil {
-		network = "udp6"
-	}
-	pc, err := net.ListenPacket(network, net.JoinHostPort(localIP.String(), "0"))
-	if err != nil {
-		_, _ = tcp.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return err
-	}
-	defer pc.Close()
-
-	ua, ok := pc.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		_, _ = tcp.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return fmt.Errorf("udp bind")
-	}
-	if err := writeSOCKSReply(tcp, 0x00, ua.IP, ua.Port); err != nil {
+	ip, port := socksBindAddr(hub.LocalAddr())
+	if err := writeSOCKSReply(tcp, 0x00, ip, port); err != nil {
 		return err
 	}
 
-	peerIP := addrIP(tcp.RemoteAddr())
-	var clientAddr net.Addr
-	var mu sync.Mutex
-	done := make(chan struct{})
-	var once sync.Once
-	stop := func() { once.Do(func() { close(done) }) }
+	sess := hub.register(tcp.RemoteAddr())
+	defer hub.unregister(sess)
 
 	go func() {
-		defer stop()
-		buf := make([]byte, 64*1024)
-		for {
-			n, addr, err := pc.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			host, port, payload, err := parseSOCKSUDP(buf[:n])
-			if err != nil {
-				continue
-			}
-			mu.Lock()
-			pinned, ok := udpAllowed(peerIP, clientAddr, addr)
-			if !ok {
-				mu.Unlock()
-				continue
-			}
-			clientAddr = pinned
-			mu.Unlock()
-			var dest net.Addr
-			if ip := net.ParseIP(host); ip != nil {
-				dest = &net.UDPAddr{IP: ip, Port: int(port)}
-			} else {
-				dest = socksHostAddr{host: host, port: int(port)}
-			}
-			_, _ = up.WriteTo(payload, dest)
-		}
-	}()
-	go func() {
-		defer stop()
 		buf := make([]byte, 64*1024)
 		for {
 			n, addr, err := up.ReadFrom(buf)
 			if err != nil {
+				sess.stop()
 				return
 			}
-			mu.Lock()
-			dst := clientAddr
-			mu.Unlock()
+			dst := hub.clientOf(sess)
 			if dst == nil {
 				continue
 			}
-			pkt := encodeSOCKSUDP(addr, buf[:n])
-			_, _ = pc.WriteTo(pkt, dst)
+			_, _ = hub.WriteTo(encodeSOCKSUDP(addr, buf[:n]), dst)
 		}
 	}()
 	go func() {
 		_, _ = io.Copy(io.Discard, br)
-		stop()
+		sess.stop()
 	}()
-	<-done
-	return nil
-}
-
-func udpLocalOK(local net.Addr) bool {
-	ip := addrIP(local)
-	return ip != nil && ip.IsLoopback()
+	for {
+		select {
+		case d, ok := <-sess.ch:
+			if !ok {
+				return nil
+			}
+			_, _ = up.WriteTo(d.payload, d.dest)
+		case <-sess.done:
+			return nil
+		}
+	}
 }
 
 func addrIP(a net.Addr) net.IP {

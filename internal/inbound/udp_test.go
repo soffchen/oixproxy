@@ -63,15 +63,15 @@ func (m *memPC) SetWriteDeadline(time.Time) error { return nil }
 func TestSOCKS5UDPAssociate(t *testing.T) {
 	pc := &memPC{ch: make(chan pkt), loc: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}}
 	udp := func() (net.PacketConn, error) { return pc, nil }
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	h := func(network, host string, port uint16) (net.Conn, error) {
+		return nil, io.ErrClosedPipe
+	}
+	ln, err := ListenMixed("127.0.0.1:0", "", "", h, udp)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	h := func(network, host string, port uint16) (net.Conn, error) {
-		return nil, io.ErrClosedPipe
-	}
-	go AcceptLoop(ln, "", "", h, udp)
+	tcpPort := ln.Addr().(*net.TCPAddr).Port
 
 	c, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
@@ -98,6 +98,9 @@ func TestSOCKS5UDPAssociate(t *testing.T) {
 		t.Fatalf("reply %v", rep)
 	}
 	port := int(binary.BigEndian.Uint16(rep[8:10]))
+	if port != tcpPort {
+		t.Fatalf("bnd port %d want tcp %d", port, tcpPort)
+	}
 	uc, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
 	if err != nil {
 		t.Fatal(err)
@@ -157,18 +160,14 @@ func TestSOCKS5UDPRejectedWithoutDialer(t *testing.T) {
 	}
 }
 
-func TestUDPLocalOKLoopbackOnly(t *testing.T) {
-	if !udpLocalOK(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}) {
-		t.Fatal("127.0.0.1")
+func TestSOCKSBindAddrUnspecified(t *testing.T) {
+	ip, port := socksBindAddr(&net.UDPAddr{IP: net.IPv4zero, Port: 7200})
+	if !ip.Equal(net.IPv4zero) || port != 7200 {
+		t.Fatalf("%v %d", ip, port)
 	}
-	if !udpLocalOK(&net.TCPAddr{IP: net.IPv6loopback, Port: 1}) {
-		t.Fatal("::1")
-	}
-	if udpLocalOK(&net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 1}) {
-		t.Fatal("lan must reject")
-	}
-	if udpLocalOK(&net.TCPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 1}) {
-		t.Fatal("unspecified must reject")
+	ip, port = socksBindAddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7201})
+	if !ip.Equal(net.IPv4(127, 0, 0, 1)) || port != 7201 {
+		t.Fatalf("%v %d", ip, port)
 	}
 }
 

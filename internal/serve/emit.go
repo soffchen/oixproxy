@@ -25,14 +25,6 @@ func socksLine(name, host string, port int, udp bool) string {
 	return fmt.Sprintf("%s = socks5, %s, %d", name, host, port)
 }
 
-func listenUDP(bind string, nodeUDP bool) bool {
-	return nodeUDP && isLoopbackHost(bind)
-}
-
-func advertiseUDP(host string, m Mapping) bool {
-	return m.UDP && isLoopbackHost(host)
-}
-
 // ClashConfig is the official /clash provider: socks5 proxies only.
 func ClashConfig(maps []Mapping, host string) string {
 	var b strings.Builder
@@ -42,7 +34,7 @@ func ClashConfig(maps []Mapping, host string) string {
 		b.WriteString("    type: socks5\n")
 		fmt.Fprintf(&b, "    server: %s\n", host)
 		fmt.Fprintf(&b, "    port: %d\n", m.Port)
-		if advertiseUDP(host, m) {
+		if m.UDP {
 			b.WriteString("    udp: true\n")
 		}
 	}
@@ -53,7 +45,7 @@ func ClashConfig(maps []Mapping, host string) string {
 func ProxyList(maps []Mapping, host string) string {
 	var b strings.Builder
 	for _, m := range maps {
-		b.WriteString(socksLine(m.Node.Name, host, m.Port, advertiseUDP(host, m)))
+		b.WriteString(socksLine(m.Node.Name, host, m.Port, m.UDP))
 		b.WriteByte('\n')
 	}
 	return b.String()
@@ -86,7 +78,7 @@ func minimalSurge(maps []Mapping, listenURL, host string) string {
 	b.WriteString("Block = reject\n\n")
 	var names []string
 	for _, m := range maps {
-		b.WriteString(socksLine(m.Node.Name, host, m.Port, advertiseUDP(host, m)))
+		b.WriteString(socksLine(m.Node.Name, host, m.Port, m.UDP))
 		b.WriteByte('\n')
 		names = append(names, m.Node.Name)
 	}
@@ -151,7 +143,7 @@ func RewriteSurge(template []byte, maps []Mapping, listenURL, host string) strin
 					out = append(out, "")
 				}
 				for _, m := range maps {
-					out = append(out, socksLine(m.Node.Name, host, m.Port, advertiseUDP(host, m)))
+					out = append(out, socksLine(m.Node.Name, host, m.Port, m.UDP))
 				}
 				wroteProxy = true
 			}
@@ -174,7 +166,7 @@ func RewriteSurge(template []byte, maps []Mapping, listenURL, host string) strin
 		// template had no [Proxy]; append one
 		out = append(out, "", "[Proxy]", "Direct = direct", "Block = reject")
 		for _, m := range maps {
-			out = append(out, socksLine(m.Node.Name, host, m.Port, advertiseUDP(host, m)))
+			out = append(out, socksLine(m.Node.Name, host, m.Port, m.UDP))
 		}
 	}
 	body := strings.Join(out, "\n")
