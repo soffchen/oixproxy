@@ -65,8 +65,10 @@ curl --socks5-hostname 127.0.0.1:7200 -o /dev/null -w '%{http_code}\n' https://w
 git clone https://github.com/soffchen/oixproxy.git
 cd oixproxy
 cp config.example.json config.json
-chmod 600 config.json
+chmod 644 config.json
 ```
+
+镜像以非 root 运行，`config.json` 必须是 `0644`，`0600` 时容器读不到配置、无法启动。
 
 编辑 `config.json`：填入 `accessToken`；建议设置 `lanAuth`，不需要鉴权时保持 `null`。
 

@@ -16,6 +16,7 @@ services:
       - "6172:6172/tcp"
       - "7200-7299:7200-7299/tcp"
     volumes:
+      # non-root image; host config.json must be 0644, not 0600
       - ./config.json:/config/config.json:ro
       - oixproxy-data:/data
     command:
