@@ -70,6 +70,7 @@ func (s *Server) Start() error {
 		s.BasePort = 7200
 	}
 	s.maps = make([]Mapping, 0, len(s.Nodes))
+	go dialer.Prefetch(s.Nodes)
 	for i, n := range s.Nodes {
 		port := s.BasePort + i
 		node := n

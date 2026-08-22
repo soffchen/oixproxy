@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -75,6 +76,191 @@ func TestHTTPSIPv4HintPreferred(t *testing.T) {
 	if len(dests) < 2 || dests[1] != "203.0.113.9:14888" {
 		t.Fatalf("want A second, got %v", dests)
 	}
+}
+
+func TestLookupADoesNotWaitOnSilentHTTPS(t *testing.T) {
+	ln, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go serveTestDNSAOnly(t, ln, "fusion_hk_1.cloud-nodes.com", net.ParseIP("203.0.113.9"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	n := Node{
+		Server: "fusion_hk_1.cloud-nodes.com",
+		Port:   14888,
+		DNS:    []DNSServer{{Network: "udp", Addr: ln.LocalAddr().String()}},
+	}
+	start := time.Now()
+	dests, err := Destinations(ctx, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("dns waited %s, HTTPS timeout should not block A", time.Since(start))
+	}
+	if dests[0] != "203.0.113.9:14888" {
+		t.Fatalf("%v", dests)
+	}
+}
+
+func TestLookupCaches(t *testing.T) {
+	ln, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var nq atomic.Int32
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := ln.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			nq.Add(1)
+			msg := buf[:n]
+			if n < 12 {
+				continue
+			}
+			got, err := questionName(msg)
+			if err != nil {
+				continue
+			}
+			id := binary.BigEndian.Uint16(msg[0:2])
+			qtype := uint16(1)
+			off := 12
+			for off < n && buf[off] != 0 {
+				off += 1 + int(buf[off])
+			}
+			if off+2 < n {
+				qtype = binary.BigEndian.Uint16(buf[off+1 : off+3])
+			}
+			if qtype != 1 {
+				continue
+			}
+			_, _ = ln.WriteTo(encodeAResponse(id, got, net.ParseIP("203.0.113.1").To4()), addr)
+		}
+	}()
+	ctx := context.Background()
+	n := Node{
+		Server: "cache-test.example",
+		Port:   1,
+		DNS:    []DNSServer{{Network: "udp", Addr: ln.LocalAddr().String()}},
+	}
+	if _, err := Destinations(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	first := nq.Load()
+	if _, err := Destinations(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	if nq.Load() != first {
+		t.Fatalf("cache miss: queries %d then %d", first, nq.Load())
+	}
+}
+
+func serveTestDNSAOnly(t *testing.T, ln net.PacketConn, qname string, ip net.IP) {
+	t.Helper()
+	buf := make([]byte, 2048)
+	for {
+		n, addr, err := ln.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		if n < 12 {
+			continue
+		}
+		got, err := questionName(buf[:n])
+		if err != nil {
+			continue
+		}
+		if needsDNSAuth(qname) && got != TokenizeHost(qname) {
+			continue
+		} else if !needsDNSAuth(qname) && got != qname {
+			continue
+		}
+		off := 12
+		for off < n && buf[off] != 0 {
+			off += 1 + int(buf[off])
+		}
+		qtype := uint16(1)
+		if off+2 < n {
+			qtype = binary.BigEndian.Uint16(buf[off+1 : off+3])
+		}
+		if qtype != 1 {
+			continue
+		}
+		id := binary.BigEndian.Uint16(buf[0:2])
+		_, _ = ln.WriteTo(encodeAResponse(id, got, ip.To4()), addr)
+	}
+}
+
+func TestUDPLookupTimesOutWithoutBlockingTCP(t *testing.T) {
+	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveTCPDNS(c, net.ParseIP("198.51.100.20"))
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	n := Node{
+		Server: "tcp-win.example",
+		Port:   14888,
+		DNS: []DNSServer{
+			{Network: "udp", Addr: udp.LocalAddr().String()},
+			{Network: "tcp", Addr: ln.Addr().String()},
+		},
+	}
+	start := time.Now()
+	dests, err := Destinations(ctx, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 1500*time.Millisecond {
+		t.Fatalf("waited %s for TCP DNS while UDP was silent", time.Since(start))
+	}
+	if dests[0] != "198.51.100.20:14888" {
+		t.Fatalf("%v", dests)
+	}
+}
+
+func serveTCPDNS(c net.Conn, ip net.IP) {
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	var ln [2]byte
+	if _, err := c.Read(ln[:]); err != nil {
+		return
+	}
+	n := int(binary.BigEndian.Uint16(ln[:]))
+	buf := make([]byte, n)
+	if _, err := readFull(c, buf); err != nil {
+		return
+	}
+	got, err := questionName(buf)
+	if err != nil {
+		return
+	}
+	id := binary.BigEndian.Uint16(buf[0:2])
+	resp := encodeAResponse(id, got, ip.To4())
+	binary.BigEndian.PutUint16(ln[:], uint16(len(resp)))
+	_, _ = c.Write(append(ln[:], resp...))
 }
 
 func TestLookupLiteralIP(t *testing.T) {

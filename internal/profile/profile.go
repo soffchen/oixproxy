@@ -111,11 +111,11 @@ func parseSurgeLine(s string) (dialer.Node, bool) {
 		Path:            firstKV(kv, "obfs-uri", "path", "obfs-path"),
 		Fingerprint:     firstKV(kv, "client-fingerprint"),
 		IdentityVersion: asInt(kv["identity-version"]),
-		Reuse:           kv["reuse"] == "true" || kv["reuse"] == "1",
+		Reuse:           kvBoolDefault(kv, "reuse", true),
 		TFO:             kv["tfo"] == "true" || kv["tfo"] == "1",
 		UDP:             kv["udp"] == "true" || kv["udp"] == "1",
 		LegacyFallback:  kvBoolDefault(kv, "legacy-fallback", true),
-		Preconnect:      clampPreconnect(asInt(kv["preconnect"])),
+		Preconnect:      kvPreconnect(kv),
 	}
 	if n.Name == "" || n.Server == "" || n.Port == 0 || n.PSK == "" || n.ECHConfig == "" {
 		return dialer.Node{}, false
@@ -216,11 +216,11 @@ func parseNode(p map[string]any) (dialer.Node, bool, error) {
 		Fingerprint:     first(obfs, "client-fingerprint"),
 		IdentityVersion: asInt(obfs["identity-version"]),
 		SkipVerify:      asBool(obfs["skip-cert-verify"]) || asBool(obfs["insecure"]),
-		Reuse:           asBool(p["reuse"]),
+		Reuse:           asBoolDefault(p["reuse"], true),
 		TFO:             asBool(p["tfo"]),
 		UDP:             asBool(p["udp"]),
 		LegacyFallback:  asBoolDefault(obfs["legacy-fallback"], true),
-		Preconnect:      clampPreconnect(asInt(obfs["preconnect"])),
+		Preconnect:      preconnectOf(obfs),
 	}
 	if n.IdentityVersion == 0 && asBool(p["identity"]) {
 		n.IdentityVersion = 2
@@ -279,6 +279,25 @@ func clampPreconnect(n int) int {
 		return 4
 	}
 	return n
+}
+
+func preconnectOf(obfs map[string]any) int {
+	if obfs == nil {
+		return 2
+	}
+	v, ok := obfs["preconnect"]
+	if !ok || v == nil {
+		return 2
+	}
+	return clampPreconnect(asInt(v))
+}
+
+func kvPreconnect(kv map[string]string) int {
+	v, ok := kv["preconnect"]
+	if !ok || v == "" {
+		return 2
+	}
+	return clampPreconnect(asInt(v))
 }
 
 func asBool(v any) bool {

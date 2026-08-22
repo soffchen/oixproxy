@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,6 +20,68 @@ func fallbackCloudNodesDNS() []DNSServer {
 		{Network: "udp", Addr: CloudNodesDNS},
 		{Network: "tcp", Addr: CloudNodesDNS},
 	}
+}
+
+const dnsCacheTTL = 60 * time.Second
+const httpsHintWait = 50 * time.Millisecond
+const udpDNSTimeout = 400 * time.Millisecond
+const tcpDNSTimeout = 3 * time.Second
+
+type dnsCacheEnt struct {
+	ips []net.IP
+	exp time.Time
+}
+
+var (
+	dnsCacheMu sync.Mutex
+	dnsCache   = map[string]dnsCacheEnt{}
+	dnsSFMu    sync.Mutex
+	dnsSF      = map[string]*dnsSFCall{}
+)
+
+type dnsSFCall struct {
+	done chan struct{}
+	ips  []net.IP
+	err  error
+}
+
+func dnsCacheKey(host string, servers []DNSServer) string {
+	var b strings.Builder
+	b.WriteString(host)
+	for _, s := range servers {
+		b.WriteByte('|')
+		b.WriteString(s.Network)
+		b.WriteByte('@')
+		b.WriteString(s.Addr)
+	}
+	return b.String()
+}
+
+func dnsCacheGet(key string) []net.IP {
+	dnsCacheMu.Lock()
+	defer dnsCacheMu.Unlock()
+	e, ok := dnsCache[key]
+	if !ok || time.Now().After(e.exp) {
+		return nil
+	}
+	out := make([]net.IP, len(e.ips))
+	for i, ip := range e.ips {
+		out[i] = append(net.IP(nil), ip...)
+	}
+	return out
+}
+
+func dnsCachePut(key string, ips []net.IP) {
+	if len(ips) == 0 {
+		return
+	}
+	stored := make([]net.IP, len(ips))
+	for i, ip := range ips {
+		stored[i] = append(net.IP(nil), ip...)
+	}
+	dnsCacheMu.Lock()
+	dnsCache[key] = dnsCacheEnt{ips: stored, exp: time.Now().Add(dnsCacheTTL)}
+	dnsCacheMu.Unlock()
 }
 
 // Lookup returns IPv4 addresses using the system resolver, or a literal IP.
@@ -47,8 +110,174 @@ func LookupServers(ctx context.Context, host string, servers []DNSServer) ([]net
 		var r net.Resolver
 		return r.LookupIP(ctx, "ip4", host)
 	}
+	ck := dnsCacheKey(host, servers)
+	if cached := dnsCacheGet(ck); len(cached) > 0 {
+		return cached, nil
+	}
+	dnsSFMu.Lock()
+	if call := dnsSF[ck]; call != nil {
+		dnsSFMu.Unlock()
+		select {
+		case <-call.done:
+			if len(call.ips) > 0 {
+				return cloneIPs(call.ips), call.err
+			}
+			return nil, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &dnsSFCall{done: make(chan struct{})}
+	dnsSF[ck] = call
+	dnsSFMu.Unlock()
+
+	ips, err := lookupServersUncached(ctx, host, servers)
+	call.ips, call.err = ips, err
+	close(call.done)
+	dnsSFMu.Lock()
+	delete(dnsSF, ck)
+	dnsSFMu.Unlock()
+	return ips, err
+}
+
+func cloneIPs(ips []net.IP) []net.IP {
+	out := make([]net.IP, len(ips))
+	for i, ip := range ips {
+		out[i] = append(net.IP(nil), ip...)
+	}
+	return out
+}
+
+func lookupServersUncached(ctx context.Context, host string, servers []DNSServer) ([]net.IP, error) {
+	ck := dnsCacheKey(host, servers)
 	qname := TokenizeHost(host)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := make(chan dnsRRResult, len(servers))
+	for _, s := range servers {
+		netw := s.Network
+		if netw == "" {
+			netw = "udp"
+		}
+		addr := s.Addr
+		go func() {
+			ips, err := lookupAAndHints(ctx, qname, addr, netw)
+			ch <- dnsRRResult{ips, err}
+		}()
+	}
 	var last error
+	for remaining := len(servers); remaining > 0; remaining-- {
+		select {
+		case r := <-ch:
+			if len(r.ips) > 0 {
+				dnsCachePut(ck, r.ips)
+				return r.ips, nil
+			}
+			if r.err != nil {
+				last = r.err
+			}
+		case <-ctx.Done():
+			if last != nil {
+				return nil, last
+			}
+			return nil, ctx.Err()
+		}
+	}
+	if last == nil {
+		last = fmt.Errorf("no A records")
+	}
+	return nil, last
+}
+
+// Prefetch resolves unique node hostnames in the background so the first
+// SOCKS CONNECT does not wait on cold DNS.
+func Prefetch(nodes []Node) {
+	seen := map[string]struct{}{}
+	for _, n := range nodes {
+		host := strings.TrimSuffix(strings.TrimSpace(n.Server), ".")
+		if host == "" || n.DialIP != "" {
+			continue
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		n := n
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = Destinations(ctx, n)
+		}()
+	}
+}
+
+type dnsRRResult struct {
+	ips []net.IP
+	err error
+}
+
+func lookupAAndHints(ctx context.Context, qname, addr, network string) ([]net.IP, error) {
+	httpsCh := make(chan dnsRRResult, 1)
+	aCh := make(chan dnsRRResult, 1)
+	go func() {
+		ips, err := lookupHTTPSHints(ctx, qname, addr, network)
+		httpsCh <- dnsRRResult{ips, err}
+	}()
+	go func() {
+		ips, err := lookupA(ctx, qname, addr, network)
+		aCh <- dnsRRResult{ips, err}
+	}()
+
+	var a dnsRRResult
+	select {
+	case a = <-aCh:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	var https dnsRRResult
+	httpsGot := false
+	timer := time.NewTimer(httpsHintWait)
+	select {
+	case https = <-httpsCh:
+		httpsGot = true
+		timer.Stop()
+	case <-timer.C:
+	case <-ctx.Done():
+		timer.Stop()
+		if a.err != nil {
+			return nil, ctx.Err()
+		}
+	}
+
+	out := mergeIPv4(https.ips, a.ips)
+	if len(out) > 0 {
+		return out, nil
+	}
+	if !httpsGot {
+		select {
+		case https = <-httpsCh:
+		case <-ctx.Done():
+			if a.err != nil {
+				return nil, a.err
+			}
+			return nil, ctx.Err()
+		}
+		out = mergeIPv4(https.ips, a.ips)
+		if len(out) > 0 {
+			return out, nil
+		}
+	}
+	if a.err != nil {
+		return nil, a.err
+	}
+	if https.err != nil {
+		return nil, https.err
+	}
+	return nil, fmt.Errorf("no A records")
+}
+
+func mergeIPv4(hint, a []net.IP) []net.IP {
 	var out []net.IP
 	seen := map[string]bool{}
 	add := func(ips []net.IP) {
@@ -65,38 +294,9 @@ func LookupServers(ctx context.Context, host string, servers []DNSServer) ([]net
 			out = append(out, append(net.IP(nil), v4...))
 		}
 	}
-	for _, s := range servers {
-		netw := s.Network
-		if netw == "" {
-			netw = "udp"
-		}
-		// Official helper (SnellCore): remainingIPs is A/AAAA plus HTTPS
-		// (rrtype 0x41) ipv4hint. Fusion names are queried as
-		// base32(ed25519(host|unix/300)).host; a bare query is a decoy.
-		hints, herr := lookupHTTPSHints(ctx, qname, s.Addr, netw)
-		if herr == nil {
-			add(hints)
-		}
-		ips, err := lookupA(ctx, qname, s.Addr, netw)
-		if err == nil {
-			add(ips)
-		} else {
-			last = err
-		}
-		if len(out) > 0 {
-			return out, nil
-		}
-		if herr != nil && last == nil {
-			last = herr
-		}
-	}
-	if len(out) > 0 {
-		return out, nil
-	}
-	if last == nil {
-		last = fmt.Errorf("no A records")
-	}
-	return nil, last
+	add(hint)
+	add(a)
+	return out
 }
 
 // Destinations is the ordered host:port list the dial path connects to.
@@ -159,7 +359,11 @@ func lookupRaw(ctx context.Context, name, dnsAddr, network string, qtype uint16)
 	if err != nil {
 		return nil, err
 	}
-	d := net.Dialer{Timeout: 3 * time.Second}
+	to := udpDNSTimeout
+	if network == "tcp" {
+		to = tcpDNSTimeout
+	}
+	d := net.Dialer{Timeout: to}
 	if deadline, ok := ctx.Deadline(); ok {
 		d.Deadline = deadline
 	}
@@ -168,7 +372,7 @@ func lookupRaw(ctx context.Context, name, dnsAddr, network string, qtype uint16)
 		return nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(to))
 	if network == "tcp" {
 		var ln [2]byte
 		binary.BigEndian.PutUint16(ln[:], uint16(len(req)))

@@ -64,6 +64,9 @@ proxies:
 	if !nodes[0].LegacyFallback {
 		t.Fatal("omitted legacy-fallback should default true")
 	}
+	if !nodes[0].Reuse || nodes[0].Preconnect != 2 {
+		t.Fatalf("omitted reuse/preconnect %+v", nodes[0])
+	}
 }
 
 func TestParseSurgeLegacyFallbackDefault(t *testing.T) {
@@ -82,6 +85,9 @@ jp = snell, jp.example, 14888, psk=test-psk, obfs=ech-tls, ech-config=AAAA, obfs
 	}
 	if nodes[1].LegacyFallback {
 		t.Fatal("explicit false must stay false")
+	}
+	if !nodes[0].Reuse || nodes[0].Preconnect != 2 {
+		t.Fatalf("omitted surge reuse/preconnect %+v", nodes[0])
 	}
 }
 

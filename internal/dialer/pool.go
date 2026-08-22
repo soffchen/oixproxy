@@ -25,13 +25,16 @@ type Pool struct {
 	node    Node
 	factory func(context.Context) (*snell.Conn, error)
 
-	mu     sync.Mutex
-	idle   []idleConn
-	closed bool
+	mu       sync.Mutex
+	idle     []idleConn
+	closed   bool
+	warming  int
+	warmCond *sync.Cond
 }
 
 func NewPool(n Node) *Pool {
 	p := &Pool{node: n}
+	p.warmCond = sync.NewCond(&p.mu)
 	p.factory = func(ctx context.Context) (*snell.Conn, error) {
 		raw, exporter, err := dialTransport(ctx, n)
 		if err != nil {
@@ -46,8 +49,17 @@ func (p *Pool) Warm(n int) {
 	if n <= 0 {
 		return
 	}
+	p.mu.Lock()
+	p.warming += n
+	p.mu.Unlock()
 	for i := 0; i < n; i++ {
 		go func() {
+			defer func() {
+				p.mu.Lock()
+				p.warming--
+				p.warmCond.Broadcast()
+				p.mu.Unlock()
+			}()
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			c, err := p.factory(ctx)
@@ -83,6 +95,9 @@ func (p *Pool) Close() {
 	p.closed = true
 	idle := p.idle
 	p.idle = nil
+	if p.warmCond != nil {
+		p.warmCond.Broadcast()
+	}
 	p.mu.Unlock()
 	for _, it := range idle {
 		_ = it.c.Close()
@@ -93,7 +108,36 @@ func (p *Pool) take(ctx context.Context) (*snell.Conn, error) {
 	if c := p.pop(); c != nil {
 		return c, nil
 	}
+	p.waitWarm(ctx)
+	if c := p.pop(); c != nil {
+		return c, nil
+	}
 	return p.factory(ctx)
+}
+
+func (p *Pool) waitWarm(ctx context.Context) {
+	p.mu.Lock()
+	if p.warming <= 0 || len(p.idle) > 0 || p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		p.mu.Lock()
+		for p.warming > 0 && len(p.idle) == 0 && !p.closed {
+			p.warmCond.Wait()
+		}
+		p.mu.Unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		p.mu.Lock()
+		p.warmCond.Broadcast()
+		p.mu.Unlock()
+	}
 }
 
 func (p *Pool) pop() *snell.Conn {
@@ -119,6 +163,7 @@ func (p *Pool) put(c *snell.Conn) bool {
 		return false
 	}
 	p.idle = append(p.idle, idleConn{c: c, used: time.Now()})
+	p.warmCond.Broadcast()
 	return true
 }
 
