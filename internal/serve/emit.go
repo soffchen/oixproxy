@@ -7,17 +7,6 @@ import (
 	"strings"
 )
 
-func isLoopbackHost(host string) bool {
-	switch host {
-	case "", "127.0.0.1", "::1", "localhost":
-		return true
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	return false
-}
-
 func socksLine(name, host string, port int, udp bool) string {
 	if udp {
 		return fmt.Sprintf("%s = socks5, %s, %d, udp-relay=true", name, host, port)

@@ -157,11 +157,11 @@ func serveSOCKS(br *bufio.Reader, c net.Conn, user, pass string, h Handler, udp 
 		return fmt.Errorf("socks version %d", req[0])
 	}
 	if req[1] == 0x03 {
-		_, _, err := readSOCKSAddr(br, req[3])
+		host, port, err := readSOCKSAddr(br, req[3])
 		if err != nil {
 			return err
 		}
-		return serveUDPAssociate(c, br, udp, hub)
+		return serveUDPAssociate(c, br, udp, hub, associateExpect(host, port))
 	}
 	if req[1] != 0x01 {
 		_, _ = c.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})

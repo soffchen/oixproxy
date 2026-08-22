@@ -161,13 +161,170 @@ func TestSOCKS5UDPRejectedWithoutDialer(t *testing.T) {
 }
 
 func TestSOCKSBindAddrUnspecified(t *testing.T) {
-	ip, port := socksBindAddr(&net.UDPAddr{IP: net.IPv4zero, Port: 7200})
+	ip, port := socksBindAddr(&net.UDPAddr{IP: net.IPv4zero, Port: 7200}, nil)
 	if !ip.Equal(net.IPv4zero) || port != 7200 {
 		t.Fatalf("%v %d", ip, port)
 	}
-	ip, port = socksBindAddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7201})
+	ip, port = socksBindAddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7201}, nil)
 	if !ip.Equal(net.IPv4(127, 0, 0, 1)) || port != 7201 {
 		t.Fatalf("%v %d", ip, port)
+	}
+	v6any := &net.UDPAddr{IP: net.IPv6unspecified, Port: 7200}
+	ip, port = socksBindAddr(v6any, &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 1})
+	if !ip.Equal(net.IPv4zero) || port != 7200 {
+		t.Fatalf("ipv4 peer on :: bind got %v %d", ip, port)
+	}
+}
+
+func TestUDPNetworkDualStack(t *testing.T) {
+	if g := udpNetwork("0.0.0.0"); g != "udp4" {
+		t.Fatalf("v4 %s", g)
+	}
+	if g := udpNetwork("::"); g != "udp" {
+		t.Fatalf("unspec v6 %s", g)
+	}
+	if g := udpNetwork("2001:db8::1"); g != "udp6" {
+		t.Fatalf("v6 %s", g)
+	}
+}
+
+func TestUDPHubAmbiguousPendingDoesNotSteal(t *testing.T) {
+	h := &udpHub{byClient: map[string]*udpSess{}}
+	a := &udpSess{peerIP: net.IPv4(127, 0, 0, 1), ch: make(chan udpDatagram, 1), done: make(chan struct{})}
+	b := &udpSess{peerIP: net.IPv4(127, 0, 0, 1), ch: make(chan udpDatagram, 1), done: make(chan struct{})}
+	h.pending = []*udpSess{a, b}
+	from := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
+	if s := h.dispatch(from); s != nil {
+		t.Fatal("two wildcard pending must not pin")
+	}
+}
+
+func TestUDPHubPinsByAssociateDST(t *testing.T) {
+	h := &udpHub{byClient: map[string]*udpSess{}}
+	a := &udpSess{
+		peerIP: net.IPv4(127, 0, 0, 1),
+		expect: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1000},
+		ch:     make(chan udpDatagram, 1),
+		done:   make(chan struct{}),
+	}
+	b := &udpSess{
+		peerIP: net.IPv4(127, 0, 0, 1),
+		expect: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2000},
+		ch:     make(chan udpDatagram, 1),
+		done:   make(chan struct{}),
+	}
+	h.pending = []*udpSess{a, b}
+	got := h.dispatch(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2000})
+	if got != b {
+		t.Fatalf("got %p want b", got)
+	}
+	got = h.dispatch(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1000})
+	if got != a {
+		t.Fatalf("got %p want a", got)
+	}
+}
+
+func TestSOCKS5UDPTwoAssociatesByDST(t *testing.T) {
+	var mu sync.Mutex
+	var pcs []*memPC
+	udp := func() (net.PacketConn, error) {
+		pc := &memPC{ch: make(chan pkt), loc: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}}
+		mu.Lock()
+		pcs = append(pcs, pc)
+		mu.Unlock()
+		return pc, nil
+	}
+	h := func(network, host string, port uint16) (net.Conn, error) {
+		return nil, io.ErrClosedPipe
+	}
+	ln, err := ListenMixed("127.0.0.1:0", "", "", h, udp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	bnd := ln.Addr().(*net.TCPAddr)
+
+	type client struct {
+		tcp net.Conn
+		uc  *net.UDPConn
+		pay byte
+	}
+	clients := make([]client, 2)
+	for i := range clients {
+		uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer uc.Close()
+		la := uc.LocalAddr().(*net.UDPAddr)
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		_, _ = c.Write([]byte{0x05, 0x01, 0x00})
+		var greet [2]byte
+		_, _ = io.ReadFull(c, greet[:])
+		req := []byte{0x05, 0x03, 0x00, 0x01}
+		req = append(req, la.IP.To4()...)
+		var pb [2]byte
+		binary.BigEndian.PutUint16(pb[:], uint16(la.Port))
+		req = append(req, pb[:]...)
+		if _, err := c.Write(req); err != nil {
+			t.Fatal(err)
+		}
+		rep := make([]byte, 10)
+		if _, err := io.ReadFull(c, rep); err != nil {
+			t.Fatal(err)
+		}
+		if rep[1] != 0 {
+			t.Fatalf("associate %v", rep)
+		}
+		pay := byte('A' + i)
+		pkt := []byte{0, 0, 0, 0x01, 8, 8, 8, 8, 0, 53, pay}
+		if _, err := uc.WriteTo(pkt, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: bnd.Port}); err != nil {
+			t.Fatal(err)
+		}
+		clients[i] = client{tcp: c, uc: uc, pay: pay}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(pcs)
+		got := make([][]byte, n)
+		for i, pc := range pcs {
+			pc.mu.Lock()
+			got[i] = append([]byte(nil), pc.got...)
+			pc.mu.Unlock()
+		}
+		mu.Unlock()
+		if n == 2 && len(got[0]) > 0 && len(got[1]) > 0 {
+			if got[0][0] == got[1][0] {
+				t.Fatalf("crossed payloads %q %q", got[0], got[1])
+			}
+			seen := map[byte]bool{got[0][0]: true, got[1][0]: true}
+			if !seen['A'] || !seen['B'] {
+				t.Fatalf("payloads %q %q", got[0], got[1])
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("did not receive both datagrams")
+}
+
+func TestUDPHubSinglePendingPins(t *testing.T) {
+	h := &udpHub{byClient: map[string]*udpSess{}}
+	s := &udpSess{peerIP: net.IPv4(10, 0, 0, 1), ch: make(chan udpDatagram, 1), done: make(chan struct{})}
+	h.pending = []*udpSess{s}
+	from := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 9}
+	if h.dispatch(from) != s {
+		t.Fatal("single pending")
+	}
+	if h.dispatch(from) != s {
+		t.Fatal("pinned lookup")
 	}
 }
 

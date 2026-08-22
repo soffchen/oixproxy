@@ -9,7 +9,7 @@ import (
 	"strconv"
 )
 
-func serveUDPAssociate(tcp net.Conn, br *bufio.Reader, udp UDPDialer, hub *udpHub) error {
+func serveUDPAssociate(tcp net.Conn, br *bufio.Reader, udp UDPDialer, hub *udpHub, expect net.Addr) error {
 	if udp == nil || hub == nil {
 		_, _ = tcp.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return fmt.Errorf("socks udp not enabled")
@@ -21,13 +21,13 @@ func serveUDPAssociate(tcp net.Conn, br *bufio.Reader, udp UDPDialer, hub *udpHu
 	}
 	defer up.Close()
 
-	ip, port := socksBindAddr(hub.LocalAddr())
+	sess := hub.register(tcp.RemoteAddr(), expect)
+	defer hub.unregister(sess)
+
+	ip, port := socksBindAddr(hub.LocalAddr(), tcp.RemoteAddr())
 	if err := writeSOCKSReply(tcp, 0x00, ip, port); err != nil {
 		return err
 	}
-
-	sess := hub.register(tcp.RemoteAddr())
-	defer hub.unregister(sess)
 
 	go func() {
 		buf := make([]byte, 64*1024)
