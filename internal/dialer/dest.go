@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -387,12 +388,12 @@ func lookupRaw(ctx context.Context, name, dnsAddr, network string, qtype uint16)
 		if _, err := conn.Write(append(ln[:], req...)); err != nil {
 			return nil, err
 		}
-		if _, err := conn.Read(ln[:]); err != nil {
+		if _, err := io.ReadFull(conn, ln[:]); err != nil {
 			return nil, err
 		}
 		n := int(binary.BigEndian.Uint16(ln[:]))
 		buf := make([]byte, n)
-		if _, err := readFull(conn, buf); err != nil {
+		if _, err := io.ReadFull(conn, buf); err != nil {
 			return nil, err
 		}
 		return buf, nil
@@ -579,16 +580,4 @@ func skipName(msg []byte, off int) (int, error) {
 		}
 		off += 1 + l
 	}
-}
-
-func readFull(c net.Conn, buf []byte) (int, error) {
-	n := 0
-	for n < len(buf) {
-		k, err := c.Read(buf[n:])
-		n += k
-		if err != nil {
-			return n, err
-		}
-	}
-	return n, nil
 }

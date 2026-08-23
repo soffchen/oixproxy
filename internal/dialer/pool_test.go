@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -130,6 +131,135 @@ func TestPoolTakeCancelDoesNotStartFactory(t *testing.T) {
 	}
 	if p.idleCount() != 1 {
 		t.Fatalf("warm idle %d", p.idleCount())
+	}
+	p.Close()
+}
+
+func TestPoolPutWakesOneWaiter(t *testing.T) {
+	var n atomic.Int32
+	var mu sync.Mutex
+	var gates []chan struct{}
+	started := make(chan struct{}, 8)
+	p := NewPool(Node{Name: "hk", Reuse: true, Preconnect: 2})
+	p.factory = func(ctx context.Context) (*snell.Conn, error) {
+		n.Add(1)
+		gate := make(chan struct{})
+		mu.Lock()
+		gates = append(gates, gate)
+		mu.Unlock()
+		started <- struct{}{}
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		a, b := net.Pipe()
+		go func() {
+			_, _ = io.Copy(io.Discard, b)
+			_ = b.Close()
+		}()
+		return snell.NewConnIdentity(a, []byte("psk"), make([]byte, identity.ExporterSize), 2), nil
+	}
+	p.Warm(2)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("warm factory")
+		}
+	}
+	errc := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			c, err := p.take(context.Background())
+			if c != nil {
+				_ = c.Close()
+			}
+			errc <- err
+		}()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for p.waiterCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if p.waiterCount() != 2 {
+		t.Fatalf("waiters %d", p.waiterCount())
+	}
+	mu.Lock()
+	close(gates[0])
+	mu.Unlock()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first take")
+	}
+	if n.Load() != 2 {
+		t.Fatalf("extra factory after first put %d", n.Load())
+	}
+	deadline = time.Now().Add(time.Second)
+	for p.waiterCount() != 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if p.waiterCount() != 1 {
+		t.Fatalf("waiters after one put %d", p.waiterCount())
+	}
+	mu.Lock()
+	close(gates[1])
+	mu.Unlock()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second take")
+	}
+	if n.Load() != 2 {
+		t.Fatalf("factory %d", n.Load())
+	}
+	p.Close()
+}
+
+func TestPoolCancelTransfersWakeup(t *testing.T) {
+	dummy := func() *snell.Conn {
+		a, b := net.Pipe()
+		go func() {
+			_, _ = io.Copy(io.Discard, b)
+			_ = b.Close()
+		}()
+		return snell.NewConnIdentity(a, []byte("psk"), make([]byte, identity.ExporterSize), 2)
+	}
+	p := NewPool(Node{Name: "hk", Reuse: true, Preconnect: 2})
+	p.warming = 2
+	chA := make(chan struct{})
+	chB := make(chan struct{})
+	p.waiters = []chan struct{}{chA, chB}
+	p.idle = []idleConn{{c: dummy(), used: time.Now()}}
+	p.notifyOneWaiterLocked()
+	select {
+	case <-chA:
+	default:
+		t.Fatal("put should close first waiter")
+	}
+	p.removeWaiter(chA)
+	select {
+	case <-chB:
+	default:
+		t.Fatal("cancel after put must wake the next waiter")
+	}
+	chC := make(chan struct{})
+	p.waiters = []chan struct{}{chC}
+	p.wakeOneIfIdle()
+	select {
+	case <-chC:
+	default:
+		t.Fatal("cancelled notified waiter must hand idle to the next")
+	}
+	if p.waiterCount() != 0 {
+		t.Fatalf("waiters %d", p.waiterCount())
 	}
 	p.Close()
 }

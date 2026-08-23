@@ -23,6 +23,74 @@ const anytlsFixture = `proxies:
   - { name: "edge", type: anytls, server: x, port: 443, password: public }
 `
 
+func TestCLIUnknownProxyMode(t *testing.T) {
+	err := Main([]string{"--profile", "x.yaml", "--mode", "wireguard"})
+	if err == nil || !strings.Contains(err.Error(), "proxyMode") {
+		t.Fatalf("err %v", err)
+	}
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfg, []byte(`{"proxyMode":"vpn","accessToken":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = Main([]string{"--config", cfg})
+	if err == nil || !strings.Contains(err.Error(), "proxyMode") {
+		t.Fatalf("config mode err %v", err)
+	}
+}
+
+func TestCLIServeFalseSkipsHTTP(t *testing.T) {
+	root := moduleRoot(t)
+	bin := filepath.Join(t.TempDir(), "oixproxy")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/oixproxy")
+	build.Dir = root
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	prof := filepath.Join(t.TempDir(), "nodes.yaml")
+	if err := os.WriteFile(prof, []byte(snellFixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	httpPort := freePort(t)
+	mapPort := freePort(t)
+	ready := filepath.Join(t.TempDir(), "ready")
+	cmd := exec.Command(bin, "--profile", prof, "--listen", "127.0.0.1:"+strconv.Itoa(httpPort), "--bind", "127.0.0.1", "--map", "--map-base-port", strconv.Itoa(mapPort), "--serve=false")
+	cmd.Env = append(os.Environ(), "OIXPROXY_READY_FILE="+ready, "OIXCLOUD_DATA="+t.TempDir())
+	cmd.Dir = root
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		_, _ = cmd.Process.Wait()
+	}()
+	if err := waitFile(ready, 8*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	_, err := http.Get("http://127.0.0.1:" + strconv.Itoa(httpPort) + "/health")
+	if err == nil {
+		t.Fatal("HTTP still serving")
+	}
+	c, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(mapPort), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	var greet [2]byte
+	if _, err := io.ReadFull(c, greet[:]); err != nil {
+		t.Fatal(err)
+	}
+	if greet != [2]byte{0x05, 0x00} {
+		t.Fatalf("socks greet %v", greet)
+	}
+}
+
 func TestCLIHelpAndVersion(t *testing.T) {
 	if err := Main([]string{"--help"}); err != nil {
 		t.Fatal(err)

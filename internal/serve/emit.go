@@ -7,11 +7,37 @@ import (
 	"strings"
 )
 
-func socksLine(name, host string, port int, udp bool) string {
-	if udp {
-		return fmt.Sprintf("%s = socks5, %s, %d, udp-relay=true", name, host, port)
+func socksLine(m Mapping, host string) string {
+	s := fmt.Sprintf("%s = socks5, %s, %d", m.Node.Name, host, m.Port)
+	if m.User != "" {
+		s += ", " + surgeQuote(m.User) + ", " + surgeQuote(m.Pass)
 	}
-	return fmt.Sprintf("%s = socks5, %s, %d", name, host, port)
+	if m.UDP {
+		s += ", udp-relay=true"
+	}
+	return s
+}
+
+func surgeQuote(s string) string {
+	if !needsSurgeQuote(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c == '"' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(c)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+func needsSurgeQuote(s string) bool {
+	return strings.ContainsAny(s, ",\"= \t")
 }
 
 // ClashConfig is the official /clash provider: socks5 proxies only.
@@ -23,6 +49,10 @@ func ClashConfig(maps []Mapping, host string) string {
 		b.WriteString("    type: socks5\n")
 		fmt.Fprintf(&b, "    server: %s\n", host)
 		fmt.Fprintf(&b, "    port: %d\n", m.Port)
+		if m.User != "" {
+			fmt.Fprintf(&b, "    username: %q\n", m.User)
+			fmt.Fprintf(&b, "    password: %q\n", m.Pass)
+		}
 		if m.UDP {
 			b.WriteString("    udp: true\n")
 		}
@@ -34,7 +64,7 @@ func ClashConfig(maps []Mapping, host string) string {
 func ProxyList(maps []Mapping, host string) string {
 	var b strings.Builder
 	for _, m := range maps {
-		b.WriteString(socksLine(m.Node.Name, host, m.Port, m.UDP))
+		b.WriteString(socksLine(m, host))
 		b.WriteByte('\n')
 	}
 	return b.String()
@@ -67,7 +97,7 @@ func minimalSurge(maps []Mapping, listenURL, host string) string {
 	b.WriteString("Block = reject\n\n")
 	var names []string
 	for _, m := range maps {
-		b.WriteString(socksLine(m.Node.Name, host, m.Port, m.UDP))
+		b.WriteString(socksLine(m, host))
 		b.WriteByte('\n')
 		names = append(names, m.Node.Name)
 	}
@@ -132,7 +162,7 @@ func RewriteSurge(template []byte, maps []Mapping, listenURL, host string) strin
 					out = append(out, "")
 				}
 				for _, m := range maps {
-					out = append(out, socksLine(m.Node.Name, host, m.Port, m.UDP))
+					out = append(out, socksLine(m, host))
 				}
 				wroteProxy = true
 			}
@@ -155,7 +185,7 @@ func RewriteSurge(template []byte, maps []Mapping, listenURL, host string) strin
 		// template had no [Proxy]; append one
 		out = append(out, "", "[Proxy]", "Direct = direct", "Block = reject")
 		for _, m := range maps {
-			out = append(out, socksLine(m.Node.Name, host, m.Port, m.UDP))
+			out = append(out, socksLine(m, host))
 		}
 	}
 	body := strings.Join(out, "\n")

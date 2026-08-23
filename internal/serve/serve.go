@@ -21,8 +21,10 @@ type Mapping struct {
 	Node dialer.Node
 	Port int
 	// UDP is ASSOCIATE + profile advertise for this listener.
-	UDP bool
-	ln  net.Listener
+	UDP  bool
+	User string
+	Pass string
+	ln   net.Listener
 }
 
 type DialFunc func(ctx context.Context, n dialer.Node, network, host string, port uint16) (net.Conn, error)
@@ -38,6 +40,8 @@ type Server struct {
 	BasePort      int
 	User          string
 	Pass          string
+	Auth          func(addr string) (user, pass string)
+	NoHTTP        bool
 	Nodes         []dialer.Node
 	Extras        []Extra
 	Template      []byte
@@ -82,12 +86,13 @@ func (s *Server) Start() error {
 		}
 		addr := net.JoinHostPort(s.Bind, strconv.Itoa(port))
 		udp := s.udpDialer(node)
-		ln, err := inbound.ListenMixed(addr, s.User, s.Pass, h, udp)
+		u, p := s.creds(addr)
+		ln, err := inbound.ListenMixed(addr, u, p, h, udp)
 		if err != nil {
 			s.Close()
 			return fmt.Errorf("listen %s: %w", addr, err)
 		}
-		s.maps = append(s.maps, Mapping{Node: n, Port: port, UDP: udp != nil, ln: ln})
+		s.maps = append(s.maps, Mapping{Node: n, Port: port, UDP: udp != nil, User: u, Pass: p, ln: ln})
 		log.Printf("mapped %s -> %s", n.Name, addr)
 	}
 	for _, extra := range s.Extras {
@@ -99,15 +104,20 @@ func (s *Server) Start() error {
 			return dial(ctx, node, network, host, portu)
 		}
 		udp := s.udpDialer(node)
-		ln, err := inbound.ListenMixed(extra.Addr, s.User, s.Pass, h, udp)
+		u, p := s.creds(extra.Addr)
+		ln, err := inbound.ListenMixed(extra.Addr, u, p, h, udp)
 		if err != nil {
 			s.Close()
 			return fmt.Errorf("listen %s: %w", extra.Addr, err)
 		}
 		_, ps, _ := net.SplitHostPort(extra.Addr)
 		port, _ := strconv.Atoi(ps)
-		s.maps = append(s.maps, Mapping{Node: extra.Node, Port: port, UDP: udp != nil, ln: ln})
+		s.maps = append(s.maps, Mapping{Node: extra.Node, Port: port, UDP: udp != nil, User: u, Pass: p, ln: ln})
 		log.Printf("mapped %s -> %s", extra.Node.Name, extra.Addr)
+	}
+
+	if s.NoHTTP {
+		return nil
 	}
 
 	mux := http.NewServeMux()
@@ -156,14 +166,26 @@ func (s *Server) dialerFor(n dialer.Node) DialFunc {
 	if s.poolByName == nil {
 		s.poolByName = map[string]*dialer.Pool{}
 	}
-	if p := s.poolByName[n.Name]; p != nil {
+	key := poolKey(n)
+	if p := s.poolByName[key]; p != nil {
 		return p.Dial
 	}
 	p := dialer.NewPool(n)
-	s.poolByName[n.Name] = p
+	s.poolByName[key] = p
 	s.pools = append(s.pools, p)
 	p.Warm(n.Preconnect)
 	return p.Dial
+}
+
+func (s *Server) creds(addr string) (string, string) {
+	if s.Auth != nil {
+		return s.Auth(addr)
+	}
+	return s.User, s.Pass
+}
+
+func poolKey(n dialer.Node) string {
+	return n.Name + "\x00" + n.Server + "\x00" + strconv.Itoa(n.Port)
 }
 
 func (s *Server) udpDialer(n dialer.Node) inbound.UDPDialer {

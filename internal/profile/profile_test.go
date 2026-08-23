@@ -3,6 +3,7 @@ package profile
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -88,6 +89,28 @@ jp = snell, jp.example, 14888, psk=test-psk, obfs=ech-tls, ech-config=AAAA, obfs
 	}
 	if !nodes[0].Reuse || nodes[0].Preconnect != 2 {
 		t.Fatalf("omitted surge reuse/preconnect %+v", nodes[0])
+	}
+}
+
+func TestParseRejectsDuplicateNames(t *testing.T) {
+	yaml := `
+proxies:
+  - { name: "hk 01", type: snell, server: a.example, port: 14888, psk: test-psk, version: 4, obfs-opts: { mode: ech-tls, ech-config: AAAA } }
+  - { name: "hk 01", type: snell, server: b.example, port: 14888, psk: test-psk, version: 4, obfs-opts: { mode: ech-tls, ech-config: AAAA } }
+`
+	if _, err := Parse([]byte(yaml)); err == nil {
+		t.Fatal("duplicate yaml names")
+	} else if !strings.Contains(err.Error(), "duplicate node name") {
+		t.Fatalf("err %v", err)
+	}
+	surge := []byte(`[Proxy]
+hk = snell, a.example, 14888, psk=test-psk, obfs=ech-tls, ech-config=AAAA, obfs-host=cover.example
+hk = snell, b.example, 14888, psk=test-psk, obfs=ech-tls, ech-config=AAAA, obfs-host=cover.example
+`)
+	if _, err := Parse(surge); err == nil {
+		t.Fatal("duplicate surge names")
+	} else if !strings.Contains(err.Error(), "duplicate node name") {
+		t.Fatalf("err %v", err)
 	}
 }
 

@@ -11,6 +11,57 @@ import (
 	"github.com/soffchen/oixproxy/internal/dialer"
 )
 
+func TestDNSPolicyExactBeatsWildcard(t *testing.T) {
+	p := ParseDNS([]byte(`
+dns:
+  nameserver-policy:
+    "+.example.com": ['udp://192.0.2.1:53']
+    example.com: ['udp://192.0.2.2:53']
+    "*.example.com": ['udp://192.0.2.3:53']
+`))
+	got := p.Match("example.com")
+	if len(got) != 1 || got[0].Addr != "192.0.2.2:53" {
+		t.Fatalf("exact %v", got)
+	}
+	got = p.Match("foo.example.com")
+	if len(got) != 1 || got[0].Addr != "192.0.2.1:53" {
+		t.Fatalf("plus %v", got)
+	}
+	got = p.Match("other.test")
+	if len(got) != 0 {
+		t.Fatalf("fallback %v", got)
+	}
+}
+
+func TestDNSPolicyLongerSuffixBeatsBroaderType(t *testing.T) {
+	p := ParseDNS([]byte(`
+dns:
+  nameserver-policy:
+    "+.com": ['udp://192.0.2.1:53']
+    "*.example.com": ['udp://192.0.2.9:53']
+    "+.example.com": ['udp://192.0.2.8:53']
+`))
+	got := p.Match("www.example.com")
+	if len(got) != 1 || got[0].Addr != "192.0.2.8:53" {
+		t.Fatalf("plus example %v", got)
+	}
+	got = p.Match("foo.com")
+	if len(got) != 1 || got[0].Addr != "192.0.2.1:53" {
+		t.Fatalf("plus com %v", got)
+	}
+
+	p = ParseDNS([]byte(`
+dns:
+  nameserver-policy:
+    "+.com": ['udp://192.0.2.1:53']
+    "*.example.com": ['udp://192.0.2.9:53']
+`))
+	got = p.Match("www.example.com")
+	if len(got) != 1 || got[0].Addr != "192.0.2.9:53" {
+		t.Fatalf("star example %v", got)
+	}
+}
+
 func TestDestinationsUseRemoteDNSPolicy(t *testing.T) {
 	ln, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

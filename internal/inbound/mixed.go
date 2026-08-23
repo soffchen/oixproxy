@@ -4,13 +4,16 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Handler dials the upstream for a TCP target.
@@ -64,11 +67,22 @@ func ListenMixed(addr string, user, pass string, h Handler, udp UDPDialer) (net.
 // AcceptLoop serves mixed SOCKS5/HTTP on ln until it is closed.
 func AcceptLoop(ln net.Listener, user, pass string, h Handler, udp UDPDialer) {
 	hub := listenerHub(ln)
+	var nerr int
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("accept: %v", err)
+			nerr++
+			if nerr > 50 {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+			continue
 		}
+		nerr = 0
 		go func() {
 			defer c.Close()
 			_ = serve(c, user, pass, h, udp, hub)
@@ -246,22 +260,8 @@ func serveHTTP(br *bufio.Reader, c net.Conn, user, pass string, h Handler) error
 		}
 		return relay(c, br, up)
 	}
-	host, port, err := splitHostPort(req.URL.Host, 80)
-	if err != nil {
-		return err
-	}
-	up, err := h("tcp", host, port)
-	if err != nil {
-		return err
-	}
-	defer up.Close()
-	req.RequestURI = ""
-	req.Header.Del("Proxy-Authorization")
-	req.Header.Del("Proxy-Connection")
-	if err := req.Write(up); err != nil {
-		return err
-	}
-	return relay(c, br, up)
+	_, _ = c.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\nAllow: CONNECT\r\nContent-Length: 0\r\n\r\n"))
+	return fmt.Errorf("http method %s", req.Method)
 }
 
 func splitHostPort(hp string, def uint16) (string, uint16, error) {

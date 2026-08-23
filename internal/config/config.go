@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -93,27 +94,38 @@ func Load(path string) (File, error) {
 	if cfg.ListenAddress == "" {
 		cfg.ListenAddress = "127.0.0.1"
 	}
-	if cfg.LANAuth != nil && (cfg.LANAuth.Username == "" || cfg.LANAuth.Password == "") {
-		return cfg, fmt.Errorf("invalid lanAuth: username and password required")
+	if cfg.LANAuth != nil {
+		if err := validLANAuth(cfg.LANAuth.Username, cfg.LANAuth.Password); err != nil {
+			return cfg, err
+		}
 	}
 	dir := filepath.Dir(path)
+	dataDir, err := DataDir()
+	if err != nil {
+		return cfg, err
+	}
 	cfg.CustomConf = firstExisting(
 		os.Getenv("OIXCLOUD_CUSTOM_CONFIG"),
 		filepath.Join(dir, "custom.conf"),
-		filepath.Join(DataDir(), "custom.conf"),
+		filepath.Join(dataDir, "custom.conf"),
 		"/config/custom.conf",
 	)
-	cfg.DataDir = DataDir()
+	cfg.DataDir = dataDir
 	return cfg, nil
 }
 
-func DataDir() string {
+func DataDir() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("OIXCLOUD_DATA")); v != "" {
+		if err := os.MkdirAll(v, 0o755); err != nil {
+			return "", fmt.Errorf("OIXCLOUD_DATA %s: %w", v, err)
+		}
+		return v, nil
+	}
 	home, _ := os.UserHomeDir()
 	return firstExistingDir(
-		os.Getenv("OIXCLOUD_DATA"),
 		"/data",
 		filepath.Join(home, ".config/oixcloud-external-proxy-program"),
-	)
+	), nil
 }
 
 func (c File) ServeAddr(listenFlag string) string {
@@ -133,18 +145,32 @@ func (c File) BindAddr(bindFlag string) string {
 	return c.ListenAddress
 }
 
+func validLANAuth(user, pass string) error {
+	if user == "" || pass == "" {
+		return fmt.Errorf("invalid lanAuth: username and password required")
+	}
+	if strings.ContainsAny(user, "\n\r\x00") || strings.ContainsAny(pass, "\n\r\x00") {
+		return fmt.Errorf("invalid lanAuth: username and password must not contain line breaks")
+	}
+	return nil
+}
+
 func (c File) AuthFor(bind string) (user, pass string) {
 	if c.LANAuth == nil {
 		return "", ""
 	}
-	host := bind
-	if h, _, err := splitHostPortSafe(bind); err == nil {
-		host = h
-	}
-	if isLoopback(host) {
+	if isLoopback(authHost(bind)) {
 		return "", ""
 	}
 	return c.LANAuth.Username, c.LANAuth.Password
+}
+
+func authHost(bind string) string {
+	bind = strings.TrimSpace(bind)
+	if h, _, err := net.SplitHostPort(bind); err == nil {
+		return h
+	}
+	return strings.Trim(bind, "[]")
 }
 
 func normalizeListen(v, defaultHost string) string {
@@ -180,12 +206,12 @@ func splitHostPortSafe(addr string) (string, string, error) {
 }
 
 func isLoopback(host string) bool {
-	switch host {
-	case "", "127.0.0.1", "::1", "localhost":
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	if host == "localhost" {
 		return true
-	default:
-		return false
 	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func firstExisting(paths ...string) string {

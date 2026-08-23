@@ -188,6 +188,63 @@ func TestUDPNetworkDualStack(t *testing.T) {
 	}
 }
 
+func TestUDPHubRejectsSecondWildcardSameIP(t *testing.T) {
+	h := &udpHub{byClient: map[string]*udpSess{}}
+	peer := &net.TCPAddr{IP: net.IPv4(10, 0, 0, 9), Port: 1}
+	a, err := h.register(peer, nil)
+	if err != nil || a == nil {
+		t.Fatalf("first: %v", err)
+	}
+	if _, err := h.register(peer, nil); err != errUDPWildcardBusy {
+		t.Fatalf("second: %v", err)
+	}
+	other, err := h.register(&net.TCPAddr{IP: net.IPv4(10, 0, 0, 8), Port: 1}, nil)
+	if err != nil || other == nil {
+		t.Fatalf("other ip: %v", err)
+	}
+}
+
+func TestSOCKS5UDPSecondWildcardAssociateRejected(t *testing.T) {
+	udp := func() (net.PacketConn, error) {
+		return &memPC{ch: make(chan pkt), loc: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}}, nil
+	}
+	h := func(network, host string, port uint16) (net.Conn, error) {
+		return nil, io.ErrClosedPipe
+	}
+	ln, err := ListenMixed("127.0.0.1:0", "", "", h, udp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	dialAssoc := func() (net.Conn, []byte) {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		_, _ = c.Write([]byte{0x05, 0x01, 0x00})
+		var greet [2]byte
+		_, _ = io.ReadFull(c, greet[:])
+		_, _ = c.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		rep := make([]byte, 10)
+		if _, err := io.ReadFull(c, rep); err != nil {
+			t.Fatal(err)
+		}
+		return c, rep
+	}
+	c1, rep1 := dialAssoc()
+	defer c1.Close()
+	if rep1[1] != 0 {
+		t.Fatalf("first associate %v", rep1)
+	}
+	c2, rep2 := dialAssoc()
+	defer c2.Close()
+	if rep2[1] != 0x01 {
+		t.Fatalf("second associate %v, want general failure", rep2)
+	}
+}
+
 func TestUDPHubAmbiguousPendingDoesNotSteal(t *testing.T) {
 	h := &udpHub{byClient: map[string]*udpSess{}}
 	a := &udpSess{peerIP: net.IPv4(127, 0, 0, 1), ch: make(chan udpDatagram, 1), done: make(chan struct{})}

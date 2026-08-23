@@ -56,7 +56,7 @@ func Main(args []string) error {
 	tray := fs.Bool("tray", false, "")
 	fs.BoolVar(tray, "menu", false, "")
 	fs.BoolVar(tray, "menubar", false, "")
-	_ = fs.Bool("serve", false, "")
+	serveHTTP := fs.Bool("serve", true, "")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -91,7 +91,10 @@ func Main(args []string) error {
 		}
 	} else {
 		cfg = config.Defaults()
-		cfg.DataDir = config.DataDir()
+		cfg.DataDir, err = config.DataDir()
+		if err != nil {
+			return err
+		}
 	}
 	if *mapFlag {
 		cfg.ProxyMode = "map"
@@ -101,6 +104,11 @@ func Main(args []string) error {
 	}
 	if *mode != "" {
 		cfg.ProxyMode = *mode
+	}
+	switch cfg.ProxyMode {
+	case "map", "single":
+	default:
+		return fmt.Errorf("unknown proxyMode %q (want map or single)", cfg.ProxyMode)
 	}
 	if *mapBase != 0 {
 		cfg.MapBasePort = *mapBase
@@ -143,15 +151,17 @@ func Main(args []string) error {
 	if cfg.ProxyMode == "single" && *node == "" && len(nodes) > 1 {
 		nodes = nodes[:1]
 	}
-	user, pass := cfg.AuthFor(bindAddr)
+	httpUser, httpPass := cfg.AuthFor(listenAddr)
 
 	exe, _ := os.Executable()
 	srv := &serve.Server{
 		Listen:        listenAddr,
 		Bind:          bindAddr,
 		BasePort:      cfg.MapBasePort,
-		User:          user,
-		Pass:          pass,
+		User:          httpUser,
+		Pass:          httpPass,
+		Auth:          cfg.AuthFor,
+		NoHTTP:        !*serveHTTP,
 		Nodes:         nodes,
 		Extras:        extraListeners(cfg, nodes, bindAddr),
 		Template:      tmpl,
@@ -226,7 +236,7 @@ func usageText(name string) string {
 	return "Usage: " + name + ` [options]
 
   --tray, --menu, --menubar      Start menu bar helper
-  --serve                        Start local managed-config HTTP server
+  --serve                        Local HTTP config server (default on; --serve=false disables)
   --listen, -l [host:]port       Serve address (default 127.0.0.1, config servePort or 6172)
   --port, -p [host:]port         Proxy listen address (SOCKS5 + HTTP)
   --bind <host>                  Bind address for proxy listeners (default 127.0.0.1)

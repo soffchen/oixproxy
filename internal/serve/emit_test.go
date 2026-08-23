@@ -97,6 +97,44 @@ AdBlock = select, Block, Direct, Proxy
 	}
 }
 
+func TestSOCKSAuthEmittedPerMapping(t *testing.T) {
+	maps := testMaps()
+	maps[0].User, maps[0].Pass = "alice", "secret"
+	maps[0].UDP = true
+	host := "203.0.113.10"
+	list := ProxyList(maps, host)
+	if !strings.Contains(list, "🇭🇰 香港 Fusion 01 = socks5, 203.0.113.10, 7200, alice, secret, udp-relay=true") {
+		t.Fatalf("list auth: %s", list)
+	}
+	if strings.Contains(list, "🇯🇵 日本 Fusion 01 = socks5, 203.0.113.10, 7201, alice") {
+		t.Fatal("unauthenticated mapping leaked lanAuth")
+	}
+	clash := ClashConfig(maps, host)
+	if !strings.Contains(clash, `username: "alice"`) || !strings.Contains(clash, `password: "secret"`) {
+		t.Fatalf("clash auth: %s", clash)
+	}
+	if strings.Count(clash, `username:`) != 1 {
+		t.Fatalf("clash username count: %s", clash)
+	}
+	surge := SurgeConfig(maps, "http://203.0.113.10:6172/", host, nil)
+	if !strings.Contains(surge, "🇭🇰 香港 Fusion 01 = socks5, 203.0.113.10, 7200, alice, secret, udp-relay=true") {
+		t.Fatalf("surge auth: %s", surge)
+	}
+}
+
+func TestSOCKSAuthSurgeQuotesSeparators(t *testing.T) {
+	maps := testMaps()
+	maps[0].User, maps[0].Pass = "al,ice", `se"cret`
+	list := ProxyList(maps, "203.0.113.10")
+	if !strings.Contains(list, `🇭🇰 香港 Fusion 01 = socks5, 203.0.113.10, 7200, "al,ice", "se\"cret"`) {
+		t.Fatalf("quoted list: %s", list)
+	}
+	clash := ClashConfig(maps, "203.0.113.10")
+	if !strings.Contains(clash, `username: "al,ice"`) || !strings.Contains(clash, `password: "se\"cret"`) {
+		t.Fatalf("clash: %s", clash)
+	}
+}
+
 func TestUDPAdvertisedWhenEnabled(t *testing.T) {
 	maps := testMaps()
 	if strings.Contains(ProxyList(maps, "127.0.0.1"), "udp-relay") {

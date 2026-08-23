@@ -1,12 +1,18 @@
 package panel
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"filippo.io/age"
+	"filippo.io/age/armor"
+
+	"github.com/soffchen/oixproxy/internal/identity"
 	"github.com/soffchen/oixproxy/internal/profile"
 )
 
@@ -146,6 +152,84 @@ func TestSimpleRulesKeepsDedicatedQueryOrder(t *testing.T) {
 	if raw != "external-proxy-program=true&simplerules=true&dedicated_access=abc.apk" {
 		t.Fatalf("query %q", raw)
 	}
+}
+
+func TestFetchInlineConfigWhenSmartEmpty(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/information", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ret":200,"msg":"success"}`))
+	})
+	mux.HandleFunc("/api/v1/managed/anywhere/direct", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"ret":404}`, 404)
+	})
+	mux.HandleFunc("/api/v1/managed/surge", func(w http.ResponseWriter, r *http.Request) {
+		cfg, _ := json.Marshal(snellYAML)
+		w.Write([]byte(`{"ret":200,"msg":"success","config":` + string(cfg) + `}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	c := New("test-access-key")
+	c.Base = ts.URL
+	c.IdentityPath = filepath.Join(t.TempDir(), ".identity")
+	nodes, err := c.FetchDedicatedNodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("nodes %d", len(nodes))
+	}
+}
+
+func TestFetchAgeEncryptedInlineConfig(t *testing.T) {
+	idPath := filepath.Join(t.TempDir(), ".identity")
+	id, err := identity.LoadOrCreateAge(idPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := ageArmor(t, id.Recipient(), []byte(snellYAML))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/information", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ret":200,"msg":"success"}`))
+	})
+	mux.HandleFunc("/api/v1/managed/anywhere/direct", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"ret":404}`, 404)
+	})
+	mux.HandleFunc("/api/v1/managed/surge", func(w http.ResponseWriter, r *http.Request) {
+		cfg, _ := json.Marshal(ct)
+		w.Write([]byte(`{"ret":200,"msg":"success","config":` + string(cfg) + `}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	c := New("test-access-key")
+	c.Base = ts.URL
+	c.IdentityPath = idPath
+	nodes, err := c.FetchDedicatedNodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("nodes %d", len(nodes))
+	}
+}
+
+func ageArmor(t *testing.T, recipient age.Recipient, plain []byte) string {
+	t.Helper()
+	var buf bytes.Buffer
+	aw := armor.NewWriter(&buf)
+	w, err := age.Encrypt(aw, recipient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(plain); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := aw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
 }
 
 func TestClash1SourceFailsDedicatedParse(t *testing.T) {

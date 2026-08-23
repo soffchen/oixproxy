@@ -21,7 +21,11 @@ func serveUDPAssociate(tcp net.Conn, br *bufio.Reader, udp UDPDialer, hub *udpHu
 	}
 	defer up.Close()
 
-	sess := hub.register(tcp.RemoteAddr(), expect)
+	sess, err := hub.register(tcp.RemoteAddr(), expect)
+	if err != nil {
+		_, _ = tcp.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return err
+	}
 	defer hub.unregister(sess)
 
 	ip, port := socksBindAddr(hub.LocalAddr(), tcp.RemoteAddr())

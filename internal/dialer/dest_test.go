@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -250,7 +251,7 @@ func serveTCPDNS(c net.Conn, ip net.IP) {
 	}
 	n := int(binary.BigEndian.Uint16(ln[:]))
 	buf := make([]byte, n)
-	if _, err := readFull(c, buf); err != nil {
+	if _, err := io.ReadFull(c, buf); err != nil {
 		return
 	}
 	got, err := questionName(buf)
@@ -316,6 +317,68 @@ func TestLookupLiteralIP(t *testing.T) {
 	}
 	if len(ips) != 1 || ips[0].String() != "192.0.2.8" {
 		t.Fatalf("%v", ips)
+	}
+}
+
+func TestTCPDNSShortLengthReads(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	const qname = "tcp-short-read.example"
+	const want = "203.0.113.88"
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+				var hdr [2]byte
+				if _, err := io.ReadFull(c, hdr[:]); err != nil {
+					return
+				}
+				n := int(binary.BigEndian.Uint16(hdr[:]))
+				buf := make([]byte, n)
+				if _, err := io.ReadFull(c, buf); err != nil {
+					return
+				}
+				got, err := questionName(buf)
+				if err != nil || got != qname {
+					return
+				}
+				id := binary.BigEndian.Uint16(buf[0:2])
+				resp := encodeAResponse(id, got, net.ParseIP(want).To4())
+				var lnbuf [2]byte
+				binary.BigEndian.PutUint16(lnbuf[:], uint16(len(resp)))
+				if _, err := c.Write(lnbuf[0:1]); err != nil {
+					return
+				}
+				time.Sleep(20 * time.Millisecond)
+				if _, err := c.Write(lnbuf[1:2]); err != nil {
+					return
+				}
+				_, _ = c.Write(resp)
+			}(c)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	n := Node{
+		Server: qname,
+		Port:   14888,
+		DNS:    []DNSServer{{Network: "tcp", Addr: ln.Addr().String()}},
+	}
+	dests, err := Destinations(ctx, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dests[0] != want+":14888" {
+		t.Fatalf("%v", dests)
 	}
 }
 

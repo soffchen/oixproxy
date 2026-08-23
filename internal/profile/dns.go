@@ -1,6 +1,7 @@
 package profile
 
 import (
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -74,7 +75,45 @@ func rulesFromMap(m map[string]any) []DNSRule {
 		}
 		out = append(out, DNSRule{Pattern: k, Servers: parseServerList(v)})
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return dnsRuleLess(out[i].Pattern, out[j].Pattern)
+	})
 	return out
+}
+
+func dnsRuleLess(a, b string) bool {
+	sa, sb := dnsSuffix(a), dnsSuffix(b)
+	if len(sa) != len(sb) {
+		return len(sa) > len(sb)
+	}
+	ra, rb := dnsPatternRank(a), dnsPatternRank(b)
+	if ra != rb {
+		return ra < rb
+	}
+	if len(a) != len(b) {
+		return len(a) > len(b)
+	}
+	return a < b
+}
+
+func dnsSuffix(p string) string {
+	switch {
+	case strings.HasPrefix(p, "+."), strings.HasPrefix(p, "*."):
+		return p[2:]
+	default:
+		return p
+	}
+}
+
+func dnsPatternRank(p string) int {
+	switch {
+	case strings.HasPrefix(p, "+."):
+		return 2
+	case strings.HasPrefix(p, "*."):
+		return 3
+	default:
+		return 1
+	}
 }
 
 func parseServerList(v any) []dialer.DNSServer {

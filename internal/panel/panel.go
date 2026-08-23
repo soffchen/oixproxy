@@ -307,6 +307,11 @@ func (c *Client) fetchSurgeTemplate() ([]dialer.Node, []byte, error) {
 		return nodes, pickTemplate(bodies, b), nil
 	}
 	if smart == "" {
+		for _, body := range bodies {
+			if nodes, err := profile.Parse(body); err == nil && len(nodes) > 0 {
+				return nodes, pickTemplate(bodies, body), nil
+			}
+		}
 		if nodes, err := profile.Parse(b); err == nil {
 			return nodes, b, nil
 		}

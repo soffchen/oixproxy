@@ -16,7 +16,10 @@ import (
 	"time"
 )
 
-const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+const (
+	wsGUID     = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	maxWSFrame = 1 << 20
+)
 
 func upgradeWebsocket(ctx context.Context, conn net.Conn, n Node) (net.Conn, error) {
 	path := n.Path
@@ -114,7 +117,14 @@ func (c *wsConn) readFrame() ([]byte, error) {
 		if _, err := io.ReadFull(c.br, ext[:]); err != nil {
 			return nil, err
 		}
-		n = int(binary.BigEndian.Uint64(ext[:]))
+		n64 := binary.BigEndian.Uint64(ext[:])
+		if n64 > maxWSFrame {
+			return nil, fmt.Errorf("websocket frame too large")
+		}
+		n = int(n64)
+	}
+	if n < 0 || n > maxWSFrame {
+		return nil, fmt.Errorf("websocket frame too large")
 	}
 	var mask [4]byte
 	if masked {

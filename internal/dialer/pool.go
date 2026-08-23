@@ -56,7 +56,7 @@ func (p *Pool) Warm(n int) {
 			defer func() {
 				p.mu.Lock()
 				p.warming--
-				if p.warming == 0 || len(p.idle) > 0 {
+				if p.warming == 0 {
 					p.notifyWaitersLocked()
 				}
 				p.mu.Unlock()
@@ -104,12 +104,27 @@ func (p *Pool) Close() {
 }
 
 func (p *Pool) take(ctx context.Context) (*snell.Conn, error) {
-	if c := p.pop(); c != nil {
-		return c, nil
-	}
-	p.waitWarm(ctx)
-	if c := p.pop(); c != nil {
-		return c, nil
+	for {
+		if c := p.pop(); c != nil {
+			return c, nil
+		}
+		ch, done := p.enqueueWaiter()
+		if done {
+			break
+		}
+		if ch == nil {
+			continue
+		}
+		select {
+		case <-ch:
+			if err := ctx.Err(); err != nil {
+				p.wakeOneIfIdle()
+				return nil, err
+			}
+		case <-ctx.Done():
+			p.removeWaiter(ch)
+			return nil, ctx.Err()
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -117,29 +132,58 @@ func (p *Pool) take(ctx context.Context) (*snell.Conn, error) {
 	return p.factory(ctx)
 }
 
-func (p *Pool) waitWarm(ctx context.Context) {
+func (p *Pool) enqueueWaiter() (ch chan struct{}, done bool) {
 	p.mu.Lock()
-	if p.warming <= 0 || len(p.idle) > 0 || p.closed {
-		p.mu.Unlock()
+	defer p.mu.Unlock()
+	if len(p.idle) > 0 {
+		return nil, false
+	}
+	if p.closed || p.warming <= 0 {
+		return nil, true
+	}
+	ch = make(chan struct{})
+	p.waiters = append(p.waiters, ch)
+	return ch, false
+}
+
+func (p *Pool) removeWaiter(ch chan struct{}) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	found := false
+	for _, w := range p.waiters {
+		if w != ch {
+			p.waiters[n] = w
+			n++
+		} else {
+			found = true
+		}
+	}
+	p.waiters = p.waiters[:n]
+	if !found {
+		p.notifyOneIfIdleLocked()
+	}
+}
+
+func (p *Pool) wakeOneIfIdle() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.notifyOneIfIdleLocked()
+}
+
+func (p *Pool) notifyOneIfIdleLocked() {
+	if len(p.idle) > 0 {
+		p.notifyOneWaiterLocked()
+	}
+}
+
+func (p *Pool) notifyOneWaiterLocked() {
+	if len(p.waiters) == 0 {
 		return
 	}
-	ch := make(chan struct{})
-	p.waiters = append(p.waiters, ch)
-	p.mu.Unlock()
-	select {
-	case <-ch:
-	case <-ctx.Done():
-		p.mu.Lock()
-		n := 0
-		for _, w := range p.waiters {
-			if w != ch {
-				p.waiters[n] = w
-				n++
-			}
-		}
-		p.waiters = p.waiters[:n]
-		p.mu.Unlock()
-	}
+	ch := p.waiters[0]
+	p.waiters = p.waiters[1:]
+	close(ch)
 }
 
 func (p *Pool) notifyWaitersLocked() {
@@ -172,8 +216,14 @@ func (p *Pool) put(c *snell.Conn) bool {
 		return false
 	}
 	p.idle = append(p.idle, idleConn{c: c, used: time.Now()})
-	p.notifyWaitersLocked()
+	p.notifyOneWaiterLocked()
 	return true
+}
+
+func (p *Pool) waiterCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.waiters)
 }
 
 func (p *Pool) idleCount() int {

@@ -25,12 +25,29 @@ func Load(path string) ([]dialer.Node, error) {
 // Accepts Clash YAML and Surge [Proxy] snell lines (the helper's two payload shapes).
 func Parse(b []byte) ([]dialer.Node, error) {
 	if nodes, err := parseYAML(b); err == nil && len(nodes) > 0 {
+		if err := uniqueNodeNames(nodes); err != nil {
+			return nil, err
+		}
 		return nodes, nil
 	}
 	if nodes := parseSurge(b); len(nodes) > 0 {
+		if err := uniqueNodeNames(nodes); err != nil {
+			return nil, err
+		}
 		return nodes, nil
 	}
 	return nil, fmt.Errorf("no snell ech-tls nodes")
+}
+
+func uniqueNodeNames(nodes []dialer.Node) error {
+	seen := map[string]struct{}{}
+	for _, n := range nodes {
+		if _, ok := seen[n.Name]; ok {
+			return fmt.Errorf("duplicate node name %q", n.Name)
+		}
+		seen[n.Name] = struct{}{}
+	}
+	return nil
 }
 
 func parseYAML(b []byte) ([]dialer.Node, error) {

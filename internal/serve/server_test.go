@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -96,5 +98,177 @@ func TestMappedPortSOCKSCONNECT(t *testing.T) {
 	defer mu.Unlock()
 	if gotHost != host || gotPort != 443 || gotNode != "🇭🇰 香港 Fusion 01" {
 		t.Fatalf("dial %s %s:%d", gotNode, gotHost, gotPort)
+	}
+}
+
+func TestConfigHTTPAuthRejects(t *testing.T) {
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpPort := httpLn.Addr().(*net.TCPAddr).Port
+	_ = httpLn.Close()
+	pln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapPort := pln.Addr().(*net.TCPAddr).Port
+	_ = pln.Close()
+
+	s := &Server{
+		Listen:   net.JoinHostPort("127.0.0.1", strconv.Itoa(httpPort)),
+		Bind:     "127.0.0.1",
+		BasePort: mapPort,
+		User:     "alice",
+		Pass:     "secret",
+		Nodes:    []dialer.Node{{Name: "hk", Server: "remote.example", Port: 443, PSK: "x", ECHConfig: "AAAA"}},
+		Dial: func(ctx context.Context, n dialer.Node, network, host string, port uint16) (net.Conn, error) {
+			a, b := net.Pipe()
+			go func() { _ = b.Close() }()
+			return a, nil
+		},
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	base := "http://" + s.Listen
+	resp, err := http.Get(base + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("health %d", resp.StatusCode)
+	}
+	resp, err = http.Get(base + "/clash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("/clash %d", resp.StatusCode)
+	}
+}
+
+func TestNoHTTPSkipsConfigServer(t *testing.T) {
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpAddr := httpLn.Addr().String()
+	_ = httpLn.Close()
+	pln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapPort := pln.Addr().(*net.TCPAddr).Port
+	_ = pln.Close()
+
+	s := &Server{
+		Listen:   httpAddr,
+		Bind:     "127.0.0.1",
+		BasePort: mapPort,
+		NoHTTP:   true,
+		Nodes:    []dialer.Node{{Name: "hk", Server: "remote.example", Port: 443, PSK: "x", ECHConfig: "AAAA"}},
+		Dial: func(ctx context.Context, n dialer.Node, network, host string, port uint16) (net.Conn, error) {
+			a, b := net.Pipe()
+			go func() { _ = b.Close() }()
+			return a, nil
+		},
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	_, err = net.DialTimeout("tcp", httpAddr, 200*time.Millisecond)
+	if err == nil {
+		t.Fatal("HTTP still bound")
+	}
+	c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(mapPort)), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+}
+
+func TestMappingsRecordListenerAuth(t *testing.T) {
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpPort := httpLn.Addr().(*net.TCPAddr).Port
+	_ = httpLn.Close()
+	pln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapPort := pln.Addr().(*net.TCPAddr).Port
+	_ = pln.Close()
+	eln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	extraAddr := eln.Addr().String()
+	_ = eln.Close()
+
+	s := &Server{
+		Listen:   net.JoinHostPort("127.0.0.1", strconv.Itoa(httpPort)),
+		Bind:     "127.0.0.1",
+		BasePort: mapPort,
+		Auth: func(addr string) (string, string) {
+			if addr == extraAddr {
+				return "alice", "secret"
+			}
+			return "", ""
+		},
+		Nodes: []dialer.Node{{Name: "loop", Server: "remote.example", Port: 443, PSK: "x", ECHConfig: "AAAA"}},
+		Extras: []Extra{{
+			Node: dialer.Node{Name: "lan", Server: "remote.example", Port: 443, PSK: "x", ECHConfig: "AAAA"},
+			Addr: extraAddr,
+		}},
+		Dial: func(ctx context.Context, n dialer.Node, network, host string, port uint16) (net.Conn, error) {
+			a, b := net.Pipe()
+			go func() { _ = b.Close() }()
+			return a, nil
+		},
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	maps := s.Mappings()
+	if len(maps) != 2 {
+		t.Fatalf("maps %d", len(maps))
+	}
+	if maps[0].User != "" || maps[0].Pass != "" {
+		t.Fatalf("loopback mapping should skip auth: %+v", maps[0])
+	}
+	if maps[1].User != "alice" || maps[1].Pass != "secret" {
+		t.Fatalf("extra mapping missing creds: %+v", maps[1])
+	}
+
+	resp, err := http.Get("http://" + s.Listen + "/list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(list), "lan = socks5, 127.0.0.1, "+strconv.Itoa(maps[1].Port)+", alice, secret") {
+		t.Fatalf("list: %s", list)
+	}
+	if strings.Contains(string(list), "loop = socks5, 127.0.0.1, "+strconv.Itoa(mapPort)+", alice") {
+		t.Fatalf("loopback leaked auth: %s", list)
+	}
+	resp, err = http.Get("http://" + s.Listen + "/clash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clash, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(clash), `username: "alice"`) || strings.Count(string(clash), `username:`) != 1 {
+		t.Fatalf("clash: %s", clash)
 	}
 }

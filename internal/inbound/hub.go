@@ -1,9 +1,14 @@
 package inbound
 
 import (
+	"errors"
+	"log"
 	"net"
 	"sync"
+	"time"
 )
+
+var errUDPWildcardBusy = errors.New("socks udp associate already pending")
 
 type udpDatagram struct {
 	dest    net.Addr
@@ -44,7 +49,7 @@ func (h *udpHub) WriteTo(p []byte, addr net.Addr) (int, error) {
 	return h.pc.WriteTo(p, addr)
 }
 
-func (h *udpHub) register(peer, expect net.Addr) *udpSess {
+func (h *udpHub) register(peer, expect net.Addr) (*udpSess, error) {
 	s := &udpSess{
 		peerIP: addrIP(peer),
 		expect: expect,
@@ -52,9 +57,16 @@ func (h *udpHub) register(peer, expect net.Addr) *udpSess {
 		done:   make(chan struct{}),
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if expect == nil && s.peerIP != nil {
+		for _, p := range h.pending {
+			if p.expect == nil && p.peerIP != nil && p.peerIP.Equal(s.peerIP) {
+				return nil, errUDPWildcardBusy
+			}
+		}
+	}
 	h.pending = append(h.pending, s)
-	h.mu.Unlock()
-	return s
+	return s, nil
 }
 
 func (h *udpHub) unregister(s *udpSess) {
@@ -82,11 +94,22 @@ func (h *udpHub) clientOf(s *udpSess) net.Addr {
 
 func (h *udpHub) readLoop() {
 	buf := make([]byte, 64*1024)
+	var nerr int
 	for {
 		n, from, err := h.pc.ReadFrom(buf)
 		if err != nil {
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("udp read: %v", err)
+			nerr++
+			if nerr > 50 {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+			continue
 		}
+		nerr = 0
 		host, port, payload, err := parseSOCKSUDP(buf[:n])
 		if err != nil {
 			continue
