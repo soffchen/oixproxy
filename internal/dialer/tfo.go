@@ -20,15 +20,17 @@ type tfoConn struct {
 	dialFn    func(ctx context.Context, early []byte) (net.Conn, error)
 	mu        sync.Mutex
 	closed    bool
+	keepAlive bool
 	rdeadline time.Time
 	wdeadline time.Time
 }
 
-func newTFOConn(parent context.Context, dests []string, base net.Dialer) net.Conn {
+func newTFOConn(parent context.Context, dests []string, base net.Dialer, keepAlive bool) net.Conn {
 	ctx, cancel := context.WithCancel(parent)
 	return &tfoConn{
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:       ctx,
+		cancel:    cancel,
+		keepAlive: keepAlive,
 		dialFn: func(ctx context.Context, early []byte) (net.Conn, error) {
 			td := tfo.Dialer{Dialer: base, DisableTFO: false}
 			var last error
@@ -60,6 +62,9 @@ func (c *tfoConn) publish(conn net.Conn, err error) {
 		return
 	}
 	if conn != nil && err == nil {
+		if c.keepAlive {
+			tcpKeepAlive(conn)
+		}
 		if e := conn.SetReadDeadline(c.rdeadline); e != nil {
 			_ = conn.Close()
 			c.err = e

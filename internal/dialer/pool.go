@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/soffchen/oixproxy/internal/snell"
@@ -24,12 +25,14 @@ type idleConn struct {
 type Pool struct {
 	node    Node
 	factory func(context.Context) (*snell.Conn, error)
+	probe   func(context.Context, *snell.Conn) error
 
-	mu      sync.Mutex
-	idle    []idleConn
-	closed  bool
-	warming int
-	waiters []chan struct{}
+	mu         sync.Mutex
+	idle       []idleConn
+	closed     bool
+	warming    int
+	bypassWarm bool
+	waiters    []chan struct{}
 }
 
 func NewPool(n Node) *Pool {
@@ -41,7 +44,35 @@ func NewPool(n Node) *Pool {
 		}
 		return snell.NewConnIdentity(raw, []byte(n.PSK), exporter, n.identityVersion()), nil
 	}
+	if n.Reuse {
+		p.probe = func(ctx context.Context, c *snell.Conn) error {
+			return c.Warmup(ctx)
+		}
+	}
 	return p
+}
+
+func (p *Pool) finishWarm() {
+	p.mu.Lock()
+	p.warming--
+	if p.warming < 0 {
+		p.warming = 0
+	}
+	if p.warming == 0 {
+		p.notifyWaitersLocked()
+	}
+	p.mu.Unlock()
+}
+
+func (p *Pool) releaseWarmWaiters() {
+	p.mu.Lock()
+	p.warming--
+	if p.warming < 0 {
+		p.warming = 0
+	}
+	p.bypassWarm = true
+	p.notifyWaitersLocked()
+	p.mu.Unlock()
 }
 
 func (p *Pool) Warm(n int) {
@@ -53,24 +84,30 @@ func (p *Pool) Warm(n int) {
 	p.mu.Unlock()
 	for i := 0; i < n; i++ {
 		go func() {
-			defer func() {
-				p.mu.Lock()
-				p.warming--
-				if p.warming == 0 {
-					p.notifyWaitersLocked()
-				}
-				p.mu.Unlock()
-			}()
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			c, err := p.factory(ctx)
 			if err != nil {
+				p.finishWarm()
 				log.Printf("preconnect %s: %v", p.node.Name, err)
+				return
+			}
+			if p.probe != nil {
+				p.releaseWarmWaiters()
+				if err := p.probe(ctx, c); err != nil {
+					log.Printf("preconnect warmup %s: %v", p.node.Name, err)
+					_ = c.Close()
+					return
+				}
+				if !p.put(c) {
+					_ = c.Close()
+				}
 				return
 			}
 			if !p.put(c) {
 				_ = c.Close()
 			}
+			p.finishWarm()
 		}()
 	}
 }
@@ -80,15 +117,30 @@ func (p *Pool) Dial(ctx context.Context, n Node, network, host string, port uint
 	case "udp", "udp4", "udp6":
 		return Dial(ctx, n, network, host, port)
 	}
-	sc, err := p.take(ctx)
-	if err != nil {
-		return nil, err
+	var last error
+	for attempt := 0; attempt < 2; attempt++ {
+		sc, err := p.take(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if dl, ok := ctx.Deadline(); ok {
+			_ = sc.SetDeadline(dl)
+		} else {
+			_ = sc.SetDeadline(time.Now().Add(20 * time.Second))
+		}
+		if err := sc.WriteConnect(host, port, n.Reuse); err != nil {
+			_ = sc.Close()
+			last = err
+			continue
+		}
+		_ = sc.SetDeadline(time.Time{})
+		pc := &pooledConn{Conn: sc, pool: p}
+		if n.Reuse {
+			pc.MarkReusable()
+		}
+		return pc, nil
 	}
-	if err := sc.WriteConnect(host, port, n.Reuse); err != nil {
-		_ = sc.Close()
-		return nil, err
-	}
-	return &pooledConn{Conn: sc, pool: p, reuse: n.Reuse}, nil
+	return nil, last
 }
 
 func (p *Pool) Close() {
@@ -138,7 +190,7 @@ func (p *Pool) enqueueWaiter() (ch chan struct{}, done bool) {
 	if len(p.idle) > 0 {
 		return nil, false
 	}
-	if p.closed || p.warming <= 0 {
+	if p.closed || p.warming <= 0 || p.bypassWarm {
 		return nil, true
 	}
 	ch = make(chan struct{})
@@ -232,45 +284,68 @@ func (p *Pool) idleCount() int {
 	return len(p.idle)
 }
 
+func (p *Pool) warmingCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.warming
+}
+
+const (
+	poolConnNew int32 = iota
+	poolConnReusable
+	poolConnClosed
+)
+
 type pooledConn struct {
 	*snell.Conn
-	pool     *Pool
-	reuse    bool
-	hcOnce   sync.Once
-	hcErr    error
-	once     sync.Once
-	closeErr error
+	pool               *Pool
+	closeWriteOnce     sync.Once
+	closeWriteReusable bool
+	closeWriteErr      error
+	once               sync.Once
+	closeErr           error
+	reusableState      atomic.Int32
+}
+
+// MarkReusable allows Close to return this stream to the pool after CONNECT-V2.
+func (c *pooledConn) MarkReusable() {
+	c.reusableState.CompareAndSwap(poolConnNew, poolConnReusable)
 }
 
 func (c *pooledConn) CloseWrite() error {
-	if !c.reuse {
-		return nil
-	}
-	return c.halfClose()
+	_, err := c.closeWrite()
+	return err
 }
 
-func (c *pooledConn) halfClose() error {
-	c.hcOnce.Do(func() {
-		c.hcErr = c.Conn.HalfClose()
+func (c *pooledConn) closeWrite() (bool, error) {
+	c.closeWriteOnce.Do(func() {
+		if c.reusableState.Swap(poolConnClosed) != poolConnReusable {
+			// relay still copies server→client; do not Close the live tunnel.
+			return
+		}
+		c.closeWriteReusable = true
+		c.closeWriteErr = c.Conn.HalfClose()
 	})
-	return c.hcErr
+	return c.closeWriteReusable, c.closeWriteErr
 }
 
 func (c *pooledConn) Close() error {
 	c.once.Do(func() {
-		if !c.reuse {
-			c.closeErr = c.Conn.Close()
-			return
-		}
-		if err := c.halfClose(); err != nil {
+		reusable, err := c.closeWrite()
+		if err != nil {
 			c.closeErr = err
 			_ = c.Conn.Close()
 			return
 		}
-		if !c.Conn.PeerClosed() {
+		if !reusable {
 			c.closeErr = c.Conn.Close()
 			return
 		}
+		if !c.Conn.PeerClosed() {
+			_ = c.Conn.Close()
+			return
+		}
+		_ = c.Conn.SetReadDeadline(time.Time{})
 		c.Conn.ResetReply()
 		if !c.pool.put(c.Conn) {
 			c.closeErr = c.Conn.Close()

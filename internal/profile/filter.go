@@ -8,8 +8,9 @@ import (
 	"github.com/soffchen/oixproxy/internal/dialer"
 )
 
-// Filter keeps nodes whose Name matches expr, using Clash Meta proxy-group
-// filter syntax: regular expressions separated by ` (OR), applied in order.
+// Filter is applied to the official dedicated list (or --profile YAML) before
+// mapping, generated configs, prefetch, or warmup. Clash Meta proxy-group
+// syntax: regular expressions separated by ` (OR), applied in order.
 // An empty expr returns nodes unchanged.
 func Filter(nodes []dialer.Node, expr string) ([]dialer.Node, error) {
 	regs, err := compileFilter(expr)

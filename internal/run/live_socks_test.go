@@ -122,11 +122,28 @@ func TestLiveDirectSnellDial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	c.Close()
-	t.Log("dial ok")
+	defer c.Close()
+	tc := tls.Client(c, &tls.Config{ServerName: "www.google.com", MinVersion: tls.VersionTLS12})
+	if err := tc.Handshake(); err != nil {
+		t.Fatalf("tls over snell: %v", err)
+	}
+	if _, err := io.WriteString(tc, "GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 80)
+	nread, err := tc.Read(buf)
+	if nread == 0 {
+		t.Fatalf("empty google response: %v", err)
+	}
+	line := strings.Split(string(buf[:nread]), "\r\n")[0]
+	t.Logf("google via snell: %q", line)
+	if !strings.HasPrefix(line, "HTTP/") {
+		t.Fatalf("not http: %q", line)
+	}
 }
 
 func TestLiveMappedSOCKSReachesGoogle(t *testing.T) {
+	// CONNECT immediately after Start; must not wait for preconnect warmup.
 	nodes := liveNodes(t)
 	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

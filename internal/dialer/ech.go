@@ -160,12 +160,13 @@ func dialTCP(ctx context.Context, n Node) (net.Conn, error) {
 		return nil, err
 	}
 	if n.TFO {
-		return newTFOConn(ctx, dests, d), nil
+		return newTFOConn(ctx, dests, d, true), nil
 	}
 	var last error
 	for _, dest := range dests {
 		tcp, err := d.DialContext(ctx, "tcp", dest)
 		if err == nil {
+			tcpKeepAlive(tcp)
 			return tcp, nil
 		}
 		last = fmt.Errorf("dial %s: %w", dest, err)

@@ -121,13 +121,6 @@ func Main(args []string) error {
 	if err != nil {
 		return err
 	}
-	nodes, err = profile.Filter(nodes, cfg.Filter)
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(cfg.Filter) != "" && len(nodes) == 0 {
-		return fmt.Errorf("filter matched no nodes")
-	}
 	if *node != "" {
 		n, err := Find(nodes, *node)
 		if err != nil {
@@ -241,7 +234,7 @@ func usageText(name string) string {
   --port, -p [host:]port         Proxy listen address (SOCKS5 + HTTP)
   --bind <host>                  Bind address for proxy listeners (default 127.0.0.1)
   --node, -n <name>              Force node name for dial mode
-  --filter <regexp>              Keep nodes matching Clash Meta filter (backtick-separated)
+  --filter <regexp>              Filter downloaded nodes (Clash Meta filter); mapping and generated configs only see matches
   --mode <single|map>            Select proxy mode (map default)
   --map                          Shortcut for --mode map
   --single                       Shortcut for --mode single
@@ -271,27 +264,44 @@ declaratively-bound fixed ports (see config.example.json).
 }
 
 func LoadNodes(cfg config.File, profilePath string) ([]dialer.Node, []byte, error) {
+	var nodes []dialer.Node
+	var tmpl []byte
 	if profilePath != "" {
-		nodes, err := profile.Load(profilePath)
-		return nodes, nil, err
+		n, err := profile.Load(profilePath)
+		if err != nil {
+			return nil, nil, err
+		}
+		nodes = n
+	} else {
+		if cfg.AccessToken == "" {
+			return nil, nil, fmt.Errorf("config.json must contain accessToken (or pass --profile)")
+		}
+		c := panel.New(cfg.AccessToken)
+		if cfg.APIBase != "" {
+			c.Base = cfg.APIBase
+		}
+		if v := os.Getenv("OIXCLOUD_API_BASE"); v != "" {
+			c.Base = v
+		}
+		c.OixParams = cfg.OixParams
+		c.SimpleRules = cfg.SimpleRules
+		if cfg.DataDir != "" {
+			c.IdentityPath = filepath.Join(cfg.DataDir, ".identity")
+		}
+		n, err := c.FetchDedicatedNodes()
+		if err != nil {
+			return nil, c.Template, err
+		}
+		nodes, tmpl = n, c.Template
 	}
-	if cfg.AccessToken == "" {
-		return nil, nil, fmt.Errorf("config.json must contain accessToken (or pass --profile)")
+	nodes, err := profile.Filter(nodes, cfg.Filter)
+	if err != nil {
+		return nil, tmpl, err
 	}
-	c := panel.New(cfg.AccessToken)
-	if cfg.APIBase != "" {
-		c.Base = cfg.APIBase
+	if strings.TrimSpace(cfg.Filter) != "" && len(nodes) == 0 {
+		return nil, tmpl, fmt.Errorf("filter matched no nodes")
 	}
-	if v := os.Getenv("OIXCLOUD_API_BASE"); v != "" {
-		c.Base = v
-	}
-	c.OixParams = cfg.OixParams
-	c.SimpleRules = cfg.SimpleRules
-	if cfg.DataDir != "" {
-		c.IdentityPath = filepath.Join(cfg.DataDir, ".identity")
-	}
-	nodes, err := c.FetchDedicatedNodes()
-	return nodes, c.Template, err
+	return nodes, tmpl, nil
 }
 
 func Find(nodes []dialer.Node, name string) (dialer.Node, error) {

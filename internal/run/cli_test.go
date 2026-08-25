@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/soffchen/oixproxy/internal/config"
 )
 
 const snellFixture = `proxies:
@@ -22,6 +24,29 @@ const snellFixture = `proxies:
 const anytlsFixture = `proxies:
   - { name: "edge", type: anytls, server: x, port: 443, password: public }
 `
+
+func TestLoadNodesAppliesFilter(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "nodes.yaml")
+	if err := os.WriteFile(p, []byte(snellFixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nodes, _, err := LoadNodes(config.File{Filter: "日本"}, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || !strings.Contains(nodes[0].Name, "日本") {
+		t.Fatalf("filtered %+v", nodes)
+	}
+	_, _, err = LoadNodes(config.File{Filter: "不存在的区域"}, p)
+	if err == nil || !strings.Contains(err.Error(), "matched no nodes") {
+		t.Fatalf("empty match err %v", err)
+	}
+	all, _, err := LoadNodes(config.File{}, p)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("empty filter %d %v", len(all), err)
+	}
+}
 
 func TestCLIUnknownProxyMode(t *testing.T) {
 	err := Main([]string{"--profile", "x.yaml", "--mode", "wireguard"})
@@ -88,6 +113,70 @@ func TestCLIServeFalseSkipsHTTP(t *testing.T) {
 	}
 	if greet != [2]byte{0x05, 0x00} {
 		t.Fatalf("socks greet %v", greet)
+	}
+}
+
+func TestCLIFilterMapsOnlyMatches(t *testing.T) {
+	root := moduleRoot(t)
+	bin := filepath.Join(t.TempDir(), "oixproxy")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/oixproxy")
+	build.Dir = root
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	prof := filepath.Join(t.TempDir(), "nodes.yaml")
+	if err := os.WriteFile(prof, []byte(snellFixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	httpPort := freePort(t)
+	mapPort := freePort(t)
+	ready := filepath.Join(t.TempDir(), "ready")
+	cmd := exec.Command(bin, "--profile", prof, "--listen", "127.0.0.1:"+strconv.Itoa(httpPort), "--bind", "127.0.0.1", "--map", "--map-base-port", strconv.Itoa(mapPort), "--filter", "日本")
+	cmd.Env = append(os.Environ(), "OIXPROXY_READY_FILE="+ready, "OIXCLOUD_DATA="+t.TempDir())
+	cmd.Dir = root
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		_, _ = cmd.Process.Wait()
+	}()
+	if err := waitFile(ready, 8*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	base := "http://127.0.0.1:" + strconv.Itoa(httpPort)
+	for _, path := range []string{"/", "/clash", "/list"} {
+		resp, err := http.Get(base + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("%s %d", path, resp.StatusCode)
+		}
+		body := string(b)
+		if !strings.Contains(body, "日本") {
+			t.Fatalf("%s missing matched node", path)
+		}
+		if strings.Contains(body, "香港") {
+			t.Fatalf("%s still lists filtered-out node", path)
+		}
+		if strings.Count(strings.ToLower(body), "socks5") < 1 {
+			t.Fatalf("%s has no socks5", path)
+		}
+	}
+	c, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(mapPort), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	c2, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(mapPort+1), 200*time.Millisecond)
+	if err == nil {
+		c2.Close()
+		t.Fatal("filtered-out node still mapped")
 	}
 }
 

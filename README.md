@@ -179,7 +179,7 @@ Surge 首次要求安装时确认，然后开启 `Set as System Proxy`。
 | `mapBasePort` | `7200` | map 模式起始端口（可被 `--map-base-port` 覆盖） |
 | `listenAddress` | `127.0.0.1` | 默认绑定地址 |
 | `simpleRules` | `false` | 为 `true` 时向面板带 `simplerules=true` |
-| `filter` | `""` | 按节点名筛选，语法同 [Clash Meta filter](https://wiki.metacubex.one/config/proxy-groups/#filter)：正则，反引号分隔多条，按条的顺序保留 |
+| `filter` | `""` | 对官方下载（或 `--profile`）的节点列表按名过滤，语法同 [Clash Meta filter](https://wiki.metacubex.one/config/proxy-groups/#filter)：正则，反引号分隔多条，按条的顺序保留。筛完之后映射、生成配置、预热都只处理留下的节点 |
 | `oixParams` | `""` | 额外面板查询参数（不会改成 `clash=1`） |
 | `lanAuth` | 无 | `{ "username", "password" }`；环回地址不鉴权，非环回对 HTTP / SOCKS5 / HTTP CONNECT 生效 |
 | `listeners` | `[]` | map 模式下额外的固定端口：`name` / `type` / `port` / `node` / `listen` |
@@ -265,7 +265,7 @@ helper 必须先于 OpenSurge 启动。helper 退出时现有 OpenSurge 连接�
 --port, -p [host:]port         single 模式代理端口
 --bind <host>                  代理监听地址
 --node, -n <name>              只使用指定节点
---filter <regexp>              按节点名筛选（同 Clash Meta filter，反引号分隔）
+--filter <regexp>              过滤官方下载的节点列表（同 Clash Meta filter）；之后只处理命中项
 --mode <single|map>            模式
 --map / --single               模式快捷方式
 --map-base-port <port>         map 起始端口

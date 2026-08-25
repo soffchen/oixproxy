@@ -1,9 +1,11 @@
 package snell
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	cryptorand "crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -39,6 +41,10 @@ const (
 	frameSize        = 1460
 	initialPadMin    = 0x100
 	initialPadSpan   = 0x100
+
+	warmupDrainTimeout = 3 * time.Second
+	warmupHost         = "www.gstatic.com"
+	warmupPort         = uint16(443)
 )
 
 // ErrZeroChunk is a v4 empty payload: the peer half-closed a reused stream.
@@ -143,27 +149,122 @@ func (c *Conn) ReadReply() error {
 			return err
 		}
 	}
-	var cmd [1]byte
-	if _, err := io.ReadFull(c.r, cmd[:]); err != nil {
+	for {
+		var cmd [1]byte
+		_, err := io.ReadFull(c.r, cmd[:])
+		if errors.Is(err, ErrZeroChunk) {
+			// Leftover half-close from the previous reused stream.
+			c.peerClosed.Store(false)
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		c.reply = true
+		switch cmd[0] {
+		case cmdTunnel:
+			return nil
+		case cmdError:
+			var rest [2]byte
+			if _, err := io.ReadFull(c.r, rest[:]); err != nil {
+				return err
+			}
+			msg := make([]byte, int(rest[1]))
+			if _, err := io.ReadFull(c.r, msg); err != nil {
+				return err
+			}
+			return fmt.Errorf("snell server code %d: %s", rest[0], msg)
+		default:
+			return fmt.Errorf("snell unexpected reply %d", cmd[0])
+		}
+	}
+}
+
+// Warmup runs a throwaway CONNECT-V2 and waits for the peer zero-chunk so
+// the transport can be pooled. A TLS ClientHello is written before ReadReply
+// because some servers only send cmdTunnel after the origin's first packet.
+func (c *Conn) Warmup(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	c.reply = true
-	switch cmd[0] {
-	case cmdTunnel:
-		return nil
-	case cmdError:
-		var rest [2]byte
-		if _, err := io.ReadFull(c.r, rest[:]); err != nil {
-			return err
-		}
-		msg := make([]byte, int(rest[1]))
-		if _, err := io.ReadFull(c.r, msg); err != nil {
-			return err
-		}
-		return fmt.Errorf("snell server code %d: %s", rest[0], msg)
-	default:
-		return fmt.Errorf("snell unexpected reply %d", cmd[0])
+	if dl, ok := ctx.Deadline(); ok {
+		_ = c.SetDeadline(dl)
+		defer func() { _ = c.SetDeadline(time.Time{}) }()
 	}
+	if err := c.WriteConnect(warmupHost, warmupPort, true); err != nil {
+		return err
+	}
+	hello, err := tlsClientHello(warmupHost)
+	if err != nil {
+		return fmt.Errorf("snell warmup: %w", err)
+	}
+	if _, err := c.Write(hello); err != nil {
+		return err
+	}
+	if err := c.ReadReply(); err != nil {
+		return fmt.Errorf("snell warmup: %w", err)
+	}
+	if err := c.HalfClose(); err != nil {
+		return err
+	}
+	drainTo := time.Now().Add(warmupDrainTimeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(drainTo) {
+		drainTo = dl
+	}
+	_ = c.SetReadDeadline(drainTo)
+	buf := make([]byte, 1024)
+	var drainErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			_ = c.SetReadDeadline(time.Time{})
+			return err
+		}
+		_, err := c.Read(buf)
+		if err != nil {
+			drainErr = err
+			break
+		}
+	}
+	_ = c.SetReadDeadline(time.Time{})
+	if !c.PeerClosed() {
+		if drainErr != nil {
+			return fmt.Errorf("snell warmup drain: %w", drainErr)
+		}
+		return errors.New("snell warmup: peer did not half-close")
+	}
+	c.ResetReply()
+	return nil
+}
+
+type helloConn struct {
+	hello []byte
+}
+
+func (c *helloConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *helloConn) Write(p []byte) (int, error)      { c.hello = append(c.hello, p...); return len(p), nil }
+func (c *helloConn) Close() error                     { return nil }
+func (c *helloConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *helloConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *helloConn) SetDeadline(time.Time) error      { return nil }
+func (c *helloConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *helloConn) SetWriteDeadline(time.Time) error { return nil }
+
+func tlsClientHello(serverName string) ([]byte, error) {
+	var hc helloConn
+	tc := tls.Client(&hc, &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12,
+		NextProtos:         []string{"http/1.1"},
+	})
+	_ = tc.Handshake()
+	if len(hc.hello) == 0 {
+		return nil, errors.New("empty clienthello")
+	}
+	return hc.hello, nil
 }
 
 // HalfClose writes a v4 zero chunk so a reused session can take another CONNECT.
