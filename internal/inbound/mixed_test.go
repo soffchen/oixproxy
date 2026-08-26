@@ -3,13 +3,22 @@ package inbound
 import (
 	"bufio"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+type writeErrorConn struct {
+	net.Conn
+	err error
+}
+
+func (c *writeErrorConn) Write([]byte) (int, error) { return 0, c.err }
 
 func echoHandler(t *testing.T) (Handler, *sync.Mutex, *string) {
 	t.Helper()
@@ -29,6 +38,19 @@ func echoHandler(t *testing.T) (Handler, *sync.Mutex, *string) {
 		return c1, nil
 	}
 	return h, &mu, &got
+}
+
+func TestRelayCopyReturnsWriteError(t *testing.T) {
+	want := errors.New("write failed")
+	a, b := net.Pipe()
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
+	err := relayCopy(&writeErrorConn{Conn: a, err: want}, strings.NewReader("payload"))
+	if !errors.Is(err, want) {
+		t.Fatalf("转发错误为 %v，期望 %v", err, want)
+	}
 }
 
 func TestHTTPNonCONNECTRejected(t *testing.T) {

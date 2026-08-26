@@ -2,6 +2,8 @@ package dialer
 
 import (
 	"context"
+	"errors"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -14,11 +16,16 @@ import (
 const (
 	poolMaxIdle = 10
 	poolIdleAge = 15 * time.Second
+	// Surge Snell 服务端在同一复用连接处理两次 CONNECT 后会关闭连接。
+	// 预热也会消耗一次，不能把达到上限的连接再次放回池中。
+	poolMaxUses       = 2
+	drainReuseTimeout = 500 * time.Millisecond
 )
 
 type idleConn struct {
 	c    *snell.Conn
 	used time.Time
+	uses int
 }
 
 // Pool keeps ready snell+ech-tls transports, matching FlClash reuse + preconnect.
@@ -92,6 +99,7 @@ func (p *Pool) Warm(n int) {
 				log.Printf("preconnect %s: %v", p.node.Name, err)
 				return
 			}
+			uses := 0
 			if p.probe != nil {
 				p.releaseWarmWaiters()
 				if err := p.probe(ctx, c); err != nil {
@@ -99,15 +107,14 @@ func (p *Pool) Warm(n int) {
 					_ = c.Close()
 					return
 				}
-				if !p.put(c) {
-					_ = c.Close()
-				}
-				return
+				uses = 1
 			}
-			if !p.put(c) {
+			if !p.put(c, uses) {
 				_ = c.Close()
 			}
-			p.finishWarm()
+			if p.probe == nil {
+				p.finishWarm()
+			}
 		}()
 	}
 }
@@ -118,8 +125,8 @@ func (p *Pool) Dial(ctx context.Context, n Node, network, host string, port uint
 		return Dial(ctx, n, network, host, port)
 	}
 	var last error
-	for attempt := 0; attempt < 2; attempt++ {
-		sc, err := p.take(ctx)
+	for attempt := 0; attempt < 3; attempt++ {
+		sc, uses, err := p.take(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -134,7 +141,7 @@ func (p *Pool) Dial(ctx context.Context, n Node, network, host string, port uint
 			continue
 		}
 		_ = sc.SetDeadline(time.Time{})
-		pc := &pooledConn{Conn: sc, pool: p}
+		pc := &pooledConn{Conn: sc, pool: p, uses: uses}
 		if n.Reuse {
 			pc.MarkReusable()
 		}
@@ -155,10 +162,10 @@ func (p *Pool) Close() {
 	}
 }
 
-func (p *Pool) take(ctx context.Context) (*snell.Conn, error) {
+func (p *Pool) take(ctx context.Context) (*snell.Conn, int, error) {
 	for {
-		if c := p.pop(); c != nil {
-			return c, nil
+		if c, uses, ok := p.pop(); ok {
+			return c, uses + 1, nil
 		}
 		ch, done := p.enqueueWaiter()
 		if done {
@@ -171,17 +178,21 @@ func (p *Pool) take(ctx context.Context) (*snell.Conn, error) {
 		case <-ch:
 			if err := ctx.Err(); err != nil {
 				p.wakeOneIfIdle()
-				return nil, err
+				return nil, 0, err
 			}
 		case <-ctx.Done():
 			p.removeWaiter(ch)
-			return nil, ctx.Err()
+			return nil, 0, ctx.Err()
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return p.factory(ctx)
+	c, err := p.factory(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	return c, 1, nil
 }
 
 func (p *Pool) enqueueWaiter() (ch chan struct{}, done bool) {
@@ -245,7 +256,7 @@ func (p *Pool) notifyWaitersLocked() {
 	p.waiters = nil
 }
 
-func (p *Pool) pop() *snell.Conn {
+func (p *Pool) pop() (*snell.Conn, int, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -256,20 +267,46 @@ func (p *Pool) pop() *snell.Conn {
 			_ = last.c.Close()
 			continue
 		}
-		return last.c
+		return last.c, last.uses, true
 	}
-	return nil
+	return nil, 0, false
 }
 
-func (p *Pool) put(c *snell.Conn) bool {
+func (p *Pool) put(c *snell.Conn, uses int) bool {
+	if uses >= poolMaxUses {
+		return false
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed || len(p.idle) >= poolMaxIdle {
 		return false
 	}
-	p.idle = append(p.idle, idleConn{c: c, used: time.Now()})
+	p.idle = append(p.idle, idleConn{c: c, used: time.Now(), uses: uses})
 	p.notifyOneWaiterLocked()
 	return true
+}
+
+// 只有完整读到服务端的零块并清除临时截止时间，连接才能再次复用。
+func drainPendingForReuse(c *snell.Conn) (reusable bool) {
+	if c.PeerClosed() {
+		return c.SetReadDeadline(time.Time{}) == nil
+	}
+	if err := c.SetReadDeadline(time.Now().Add(drainReuseTimeout)); err != nil {
+		return false
+	}
+	defer func() {
+		if err := c.SetReadDeadline(time.Time{}); err != nil {
+			reusable = false
+		}
+	}()
+	buf := make([]byte, 4096)
+	for {
+		_, err := c.Read(buf)
+		if err == nil {
+			continue
+		}
+		return errors.Is(err, io.EOF) && c.PeerClosed()
+	}
 }
 
 func (p *Pool) waiterCount() int {
@@ -299,6 +336,7 @@ const (
 type pooledConn struct {
 	*snell.Conn
 	pool               *Pool
+	uses               int
 	closeWriteOnce     sync.Once
 	closeWriteReusable bool
 	closeWriteErr      error
@@ -341,13 +379,16 @@ func (c *pooledConn) Close() error {
 			c.closeErr = c.Conn.Close()
 			return
 		}
-		if !c.Conn.PeerClosed() {
-			_ = c.Conn.Close()
+		if c.uses >= poolMaxUses {
+			c.closeErr = c.Conn.Close()
 			return
 		}
-		_ = c.Conn.SetReadDeadline(time.Time{})
+		if !drainPendingForReuse(c.Conn) {
+			c.closeErr = c.Conn.Close()
+			return
+		}
 		c.Conn.ResetReply()
-		if !c.pool.put(c.Conn) {
+		if !c.pool.put(c.Conn, c.uses) {
 			c.closeErr = c.Conn.Close()
 		}
 	})

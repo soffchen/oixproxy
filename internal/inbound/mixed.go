@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -83,10 +82,12 @@ func AcceptLoop(ln net.Listener, user, pass string, h Handler, udp UDPDialer) {
 			continue
 		}
 		nerr = 0
-		go func() {
+		go func(c net.Conn) {
 			defer c.Close()
-			_ = serve(c, user, pass, h, udp, hub)
-		}()
+			if err := serve(c, user, pass, h, udp, hub); err != nil && err != io.EOF && err != net.ErrClosed {
+				log.Printf("代理连接 %s: %v", c.RemoteAddr(), err)
+			}
+		}(c)
 	}
 }
 
@@ -299,29 +300,43 @@ func parseBasicB64(s string) (string, string, bool) {
 }
 
 func relay(client net.Conn, br *bufio.Reader, up net.Conn) error {
-	var wg sync.WaitGroup
-	wg.Add(2)
+	type result struct {
+		direction string
+		err       error
+	}
+	results := make(chan result, 2)
 	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(up, br)
-		closeWrite(up)
+		results <- result{direction: "客户端到上游", err: relayCopy(up, br)}
 	}()
 	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(client, up)
-		closeWrite(client)
+		results <- result{direction: "上游到客户端", err: relayCopy(client, up)}
 	}()
-	wg.Wait()
-	return nil
+	var errs []error
+	for range 2 {
+		result := <-results
+		if result.err == nil || errors.Is(result.err, net.ErrClosed) {
+			continue
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", result.direction, result.err))
+	}
+	return errors.Join(errs...)
 }
 
-func closeWrite(c net.Conn) {
+func relayCopy(dst net.Conn, src io.Reader) error {
+	_, err := io.Copy(dst, src)
+	if closeErr := closeWrite(dst); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func closeWrite(c net.Conn) error {
 	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.CloseWrite()
-		return
+		return tc.CloseWrite()
 	}
 	type closer interface{ CloseWrite() error }
 	if cw, ok := c.(closer); ok {
-		_ = cw.CloseWrite()
+		return cw.CloseWrite()
 	}
+	return nil
 }

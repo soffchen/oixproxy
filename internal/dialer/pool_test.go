@@ -40,9 +40,12 @@ func TestPoolWarmTakesIdle(t *testing.T) {
 	if p.idleCount() != 2 || n.Load() != 2 {
 		t.Fatalf("idle %d factory %d", p.idleCount(), n.Load())
 	}
-	c, err := p.take(context.Background())
+	c, uses, err := p.take(context.Background())
 	if err != nil || c == nil {
 		t.Fatalf("take: %v", err)
+	}
+	if uses != 1 {
+		t.Fatalf("uses %d", uses)
 	}
 	if n.Load() != 2 {
 		t.Fatalf("factory after take %d", n.Load())
@@ -79,9 +82,12 @@ func TestPoolTakeWaitsForWarm(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		close(release)
 	}()
-	c, err := p.take(context.Background())
+	c, uses, err := p.take(context.Background())
 	if err != nil || c == nil {
 		t.Fatalf("take: %v", err)
+	}
+	if uses != 1 {
+		t.Fatalf("uses %d", uses)
 	}
 	if n.Load() != 1 {
 		t.Fatalf("factory %d, want warm conn", n.Load())
@@ -114,7 +120,7 @@ func TestPoolTakeCancelDoesNotStartFactory(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
 	go func() {
-		_, err := p.take(ctx)
+		_, _, err := p.take(ctx)
 		errc <- err
 	}()
 	time.Sleep(30 * time.Millisecond)
@@ -177,7 +183,7 @@ func TestPoolPutWakesOneWaiter(t *testing.T) {
 	errc := make(chan error, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
-			c, err := p.take(context.Background())
+			c, _, err := p.take(context.Background())
 			if c != nil {
 				_ = c.Close()
 			}
@@ -243,7 +249,7 @@ func TestPoolCancelTransfersWakeup(t *testing.T) {
 	chA := make(chan struct{})
 	chB := make(chan struct{})
 	p.waiters = []chan struct{}{chA, chB}
-	p.idle = []idleConn{{c: dummy(), used: time.Now()}}
+	p.idle = []idleConn{{c: dummy(), used: time.Now(), uses: 1}}
 	p.notifyOneWaiterLocked()
 	select {
 	case <-chA:
@@ -448,7 +454,7 @@ func TestPoolTakeFactoriesWhileProbeRuns(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	c, err := p.take(ctx)
+	c, _, err := p.take(ctx)
 	if err != nil || c == nil {
 		t.Fatalf("take during probe: %v", err)
 	}
@@ -490,7 +496,7 @@ func TestPoolTakeFactoriesWhileSiblingStillWarming(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	c, err := p.take(ctx)
+	c, _, err := p.take(ctx)
 	if err != nil || c == nil {
 		t.Fatalf("take while sibling factory blocked: %v", err)
 	}
@@ -641,5 +647,147 @@ func TestPoolDialRetriesDeadConn(t *testing.T) {
 	got, err := pc.Read(buf)
 	if err != nil || string(buf[:got]) != "ok" {
 		t.Fatalf("read %q %v", buf[:got], err)
+	}
+}
+
+func TestPoolPutRejectsMaxUses(t *testing.T) {
+	p := newTestPool(Node{Name: "hk", Reuse: true})
+	a, b := net.Pipe()
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
+	go func() { _, _ = io.Copy(io.Discard, b) }()
+	c := snell.NewConnIdentity(a, []byte("psk"), make([]byte, identity.ExporterSize), 2)
+	if p.put(c, poolMaxUses) {
+		t.Fatal("put at cap")
+	}
+	if p.idleCount() != 0 {
+		t.Fatalf("idle %d", p.idleCount())
+	}
+}
+
+func TestPoolWarmCountsTowardMaxUses(t *testing.T) {
+	const psk = "test-psk"
+	p := newTestPool(Node{Name: "hk", Reuse: true, Preconnect: 1})
+	p.probe = func(context.Context, *snell.Conn) error { return nil }
+	var factories atomic.Int32
+	stop := make(chan struct{})
+	t.Cleanup(func() {
+		close(stop)
+		p.Close()
+	})
+	p.factory = func(context.Context) (*snell.Conn, error) {
+		factories.Add(1)
+		a, b := net.Pipe()
+		go func() {
+			defer b.Close()
+			_, _ = io.Copy(io.Discard, b)
+		}()
+		go func() {
+			peer := snell.NewConnIdentity(b, []byte(psk), nil, 2)
+			if _, err := peer.Write([]byte{0}); err != nil {
+				return
+			}
+			if _, err := peer.Write([]byte("ok")); err != nil {
+				return
+			}
+			_ = peer.HalfClose()
+			<-stop
+		}()
+		return snell.NewConnIdentity(a, []byte(psk), nil, 2), nil
+	}
+
+	p.Warm(1)
+	deadline := time.Now().Add(2 * time.Second)
+	for p.idleCount() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if p.idleCount() != 1 {
+		t.Fatalf("预热连接数为 %d，期望 1", p.idleCount())
+	}
+
+	c, err := p.Dial(context.Background(), Node{Name: "hk", Reuse: true}, "tcp", "example.com", 443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc, ok := c.(*pooledConn)
+	if !ok {
+		t.Fatalf("连接类型为 %T", c)
+	}
+	if pc.uses != poolMaxUses {
+		t.Fatalf("使用次数为 %d，期望 %d", pc.uses, poolMaxUses)
+	}
+	buf := make([]byte, 8)
+	n, err := pc.Read(buf)
+	if err != nil || string(buf[:n]) != "ok" {
+		t.Fatalf("读取 %q: %v", buf[:n], err)
+	}
+	if _, err := pc.Read(buf); err != io.EOF {
+		t.Fatalf("结束错误为 %v，期望 EOF", err)
+	}
+	if err := pc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if p.idleCount() != 0 {
+		t.Fatalf("达到复用上限后仍有 %d 条空闲连接", p.idleCount())
+	}
+	if factories.Load() != 1 {
+		t.Fatalf("创建了 %d 条连接，期望 1", factories.Load())
+	}
+}
+
+func TestPoolCloseAtMaxUsesClosesTCP(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	accepted := make(chan acceptResult, 1)
+	go func() {
+		c, err := ln.Accept()
+		accepted <- acceptResult{conn: c, err: err}
+	}()
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := <-accepted
+	if result.err != nil {
+		_ = raw.Close()
+		t.Fatal(result.err)
+	}
+	peer := result.conn
+	t.Cleanup(func() { _ = peer.Close() })
+
+	p := newTestPool(Node{Name: "hk", Reuse: true})
+	pc := &pooledConn{
+		Conn: snell.NewConnIdentity(raw, []byte("test-psk"), nil, 2),
+		pool: p,
+		uses: poolMaxUses,
+	}
+	pc.MarkReusable()
+	if err := pc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if p.idleCount() != 0 {
+		t.Fatalf("达到复用上限后仍有 %d 条空闲连接", p.idleCount())
+	}
+	if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	for {
+		_, err := peer.Read(buf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("等待 TCP FIN: %v", err)
+		}
 	}
 }

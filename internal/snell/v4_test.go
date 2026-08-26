@@ -91,6 +91,21 @@ func TestReadReplySkipsLeftoverZeroChunk(t *testing.T) {
 	}
 }
 
+func TestReadReplyPrematureEOFIsProtocolError(t *testing.T) {
+	a, b := net.Pipe()
+	client := NewConnIdentity(a, []byte("test-psk"), nil, 2)
+	_ = b.Close()
+	t.Cleanup(func() { _ = a.Close() })
+
+	err := client.ReadReply()
+	if err == io.EOF {
+		t.Fatal("提前关闭不能作为正常 EOF 返回")
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("错误为 %v，期望包含 EOF", err)
+	}
+}
+
 func readWarmupRequest(peer *Conn) error {
 	if peer.r == nil {
 		if err := peer.initReader(); err != nil {

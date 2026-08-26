@@ -146,7 +146,7 @@ func (c *Conn) ReadReply() error {
 	}
 	if c.r == nil {
 		if err := c.initReader(); err != nil {
-			return err
+			return fmt.Errorf("snell reply: %w", err)
 		}
 	}
 	for {
@@ -158,7 +158,7 @@ func (c *Conn) ReadReply() error {
 			continue
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("snell reply: %w", err)
 		}
 		c.reply = true
 		switch cmd[0] {
@@ -167,11 +167,11 @@ func (c *Conn) ReadReply() error {
 		case cmdError:
 			var rest [2]byte
 			if _, err := io.ReadFull(c.r, rest[:]); err != nil {
-				return err
+				return fmt.Errorf("snell error reply: %w", err)
 			}
 			msg := make([]byte, int(rest[1]))
 			if _, err := io.ReadFull(c.r, msg); err != nil {
-				return err
+				return fmt.Errorf("snell error reply: %w", err)
 			}
 			return fmt.Errorf("snell server code %d: %s", rest[0], msg)
 		default:
