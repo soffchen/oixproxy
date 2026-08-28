@@ -145,11 +145,6 @@ func dialTransport(ctx context.Context, n Node) (net.Conn, []byte, error) {
 	return conn, exporter, nil
 }
 
-func needsPrivateDNS(host string) bool {
-	h := strings.ToLower(host)
-	return h == "cloud-nodes.com" || strings.HasSuffix(h, ".cloud-nodes.com")
-}
-
 func dialTCP(ctx context.Context, n Node) (net.Conn, error) {
 	d := net.Dialer{Timeout: 15 * time.Second}
 	if deadline, ok := ctx.Deadline(); ok {

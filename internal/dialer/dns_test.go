@@ -21,13 +21,13 @@ func TestParseNameserver(t *testing.T) {
 }
 
 func TestDomainMatch(t *testing.T) {
-	if !DomainMatch("+.cloud-nodes.com", "fusion_hk_1.cloud-nodes.com") {
+	if !DomainMatch("+.example.com", "n1.example.com") {
 		t.Fatal("subdomain")
 	}
-	if !DomainMatch("+.cloud-nodes.com", "cloud-nodes.com") {
+	if !DomainMatch("+.example.com", "example.com") {
 		t.Fatal("apex")
 	}
-	if DomainMatch("+.cloud-nodes.com", "evil.com") {
+	if DomainMatch("+.example.com", "evil.com") {
 		t.Fatal("negative")
 	}
 }

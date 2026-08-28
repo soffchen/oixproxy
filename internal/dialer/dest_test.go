@@ -12,14 +12,24 @@ import (
 	"time"
 )
 
+func signedDNSHost(t *testing.T) string {
+	t.Helper()
+	dnsAuthInit()
+	if dnsAuthSuffix == "" {
+		t.Fatal("dns-auth suffix unavailable")
+	}
+	return "n1." + dnsAuthSuffix
+}
+
 func TestDestinationsUsesPrivateDNSNotEnv(t *testing.T) {
 	const want = "203.0.113.9"
+	host := signedDNSHost(t)
 	ln, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go serveTestDNS(t, ln, "fusion_hk_1.cloud-nodes.com", net.ParseIP(want))
+	go serveTestDNS(t, ln, host, net.ParseIP(want))
 
 	t.Setenv("OIX_DIAL_IP", "198.51.100.1")
 
@@ -27,7 +37,7 @@ func TestDestinationsUsesPrivateDNSNotEnv(t *testing.T) {
 	defer cancel()
 
 	n := Node{
-		Server: "fusion_hk_1.cloud-nodes.com",
+		Server: host,
 		Port:   14888,
 		DNS:    []DNSServer{{Network: "udp", Addr: ln.LocalAddr().String()}},
 	}
@@ -57,13 +67,14 @@ func TestHTTPSIPv4HintPreferred(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go serveTestDNSMixed(t, ln, "fusion_hk_1.cloud-nodes.com",
+	host := signedDNSHost(t)
+	go serveTestDNSMixed(t, ln, host,
 		net.ParseIP("203.0.113.9"), net.ParseIP("198.51.100.10"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	n := Node{
-		Server: "fusion_hk_1.cloud-nodes.com",
+		Server: host,
 		Port:   14888,
 		DNS:    []DNSServer{{Network: "udp", Addr: ln.LocalAddr().String()}},
 	}
@@ -85,12 +96,13 @@ func TestLookupADoesNotWaitOnSilentHTTPS(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go serveTestDNSAOnly(t, ln, "fusion_hk_1.cloud-nodes.com", net.ParseIP("203.0.113.9"))
+	host := signedDNSHost(t)
+	go serveTestDNSAOnly(t, ln, host, net.ParseIP("203.0.113.9"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	n := Node{
-		Server: "fusion_hk_1.cloud-nodes.com",
+		Server: host,
 		Port:   14888,
 		DNS:    []DNSServer{{Network: "udp", Addr: ln.LocalAddr().String()}},
 	}

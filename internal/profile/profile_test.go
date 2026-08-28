@@ -40,11 +40,11 @@ dns:
   enable: true
   default-nameserver: [119.29.29.29]
   proxy-server-nameserver-policy:
-    +.cloud-nodes.com: ['udp://124.221.68.73:1053', 'tcp://124.221.68.73:1053']
+    +.example.com: ['udp://192.0.2.53:53', 'tcp://192.0.2.53:53']
   nameserver-policy:
-    +.example.com: ['udp://192.0.2.53:53']
+    +.other.example: ['udp://192.0.2.54:53']
 proxies:
-  - { name: "hk 01", type: snell, server: fusion_hk_1.cloud-nodes.com, port: 14888, psk: test-psk, version: 4, reuse: true, obfs-opts: { mode: ech-tls, alpn: snell-ech/1, sni: cover.example, ech-config: AAAA } }
+  - { name: "hk 01", type: snell, server: n1.example.com, port: 14888, psk: test-psk, version: 4, reuse: true, obfs-opts: { mode: ech-tls, alpn: snell-ech/1, sni: cover.example, ech-config: AAAA } }
 `
 	nodes, err := Parse([]byte(yaml))
 	if err != nil {
@@ -56,10 +56,10 @@ proxies:
 	if len(nodes[0].DNS) != 2 {
 		t.Fatalf("dns %v", nodes[0].DNS)
 	}
-	if nodes[0].DNS[0].Addr != "124.221.68.73:1053" || nodes[0].DNS[0].Network != "udp" {
+	if nodes[0].DNS[0].Addr != "192.0.2.53:53" || nodes[0].DNS[0].Network != "udp" {
 		t.Fatalf("udp server %+v", nodes[0].DNS[0])
 	}
-	if nodes[0].DNS[1].Addr != "124.221.68.73:1053" || nodes[0].DNS[1].Network != "tcp" {
+	if nodes[0].DNS[1].Addr != "192.0.2.53:53" || nodes[0].DNS[1].Network != "tcp" {
 		t.Fatalf("tcp server %+v", nodes[0].DNS[1])
 	}
 	if !nodes[0].LegacyFallback {

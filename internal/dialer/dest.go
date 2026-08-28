@@ -92,7 +92,7 @@ func Lookup(ctx context.Context, host string) ([]net.IP, error) {
 
 // LookupServers resolves host via the dedicated-profile nameservers (Clash
 // proxy-server-nameserver-policy). Empty servers use the system resolver,
-// except *.cloud-nodes.com falls back to the helper's compiled DNS.
+// except DNS-Auth names fall back to the helper's compiled DNS.
 func LookupServers(ctx context.Context, host string, servers []DNSServer) ([]net.IP, error) {
 	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
 	if host == "" {
@@ -104,7 +104,7 @@ func LookupServers(ctx context.Context, host string, servers []DNSServer) ([]net
 		}
 		return []net.IP{ip}, nil
 	}
-	if len(servers) == 0 && needsPrivateDNS(host) {
+	if len(servers) == 0 && needsDNSAuth(host) {
 		servers = fallbackCloudNodesDNS()
 	}
 	if len(servers) == 0 {

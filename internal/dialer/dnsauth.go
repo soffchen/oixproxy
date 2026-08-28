@@ -14,8 +14,8 @@ import (
 
 // Official helper / FlClash DNS-Auth: 1053 answers the real node A only when
 // the QNAME is two base32 labels of an Ed25519 signature over
-// "{hostname}|{unix/300}". A bare fusion_*.cloud-nodes.com query returns the
-// decoy 119.40.182.189.
+// "{hostname}|{unix/300}". A bare hostname query returns the decoy
+// 119.40.182.189.
 const (
 	blobDNSAuthSeed   = "v2:DDDuMItojgbE/L++M/zoUEkxK5qDdczw7XEeUXbpTdi7E9ht5E3k1j/xO4PHT4ikxyvx1g=="
 	blobDNSAuthDomain = "v2:BeMEuTC7THjx4pV6fBQ/ZGnQkHxujeM="
@@ -51,7 +51,7 @@ func needsDNSAuth(host string) bool {
 }
 
 // TokenizeHost prepends the DNS-Auth signature labels used by the official
-// helper when resolving dedicated Fusion hostnames. Other names are unchanged.
+// helper when resolving dedicated hostnames. Other names are unchanged.
 func TokenizeHost(host string) string {
 	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 	if h == "" || !needsDNSAuth(h) {

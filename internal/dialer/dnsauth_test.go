@@ -17,19 +17,18 @@ func TestTokenizeHostLeavesPlainNames(t *testing.T) {
 	}
 }
 
-func TestTokenizeHostSignsCloudNodes(t *testing.T) {
-	const host = "fusion_hk_1.cloud-nodes.com"
+func TestTokenizeHostSignsAuthDomain(t *testing.T) {
+	host := signedDNSHost(t)
 	got := TokenizeHost(host)
 	if got == host {
 		t.Fatal("missing DNS-Auth labels")
 	}
 	if !strings.HasSuffix(got, "."+host) {
-		t.Fatalf("suffix %s", got)
+		t.Fatalf("missing suffix")
 	}
 	labels := strings.Split(got, ".")
-	// p1.p2.fusion_hk_1.cloud-nodes.com
-	if len(labels) != 5 {
-		t.Fatalf("labels %v", labels)
+	if len(labels) != 2+len(strings.Split(host, ".")) {
+		t.Fatalf("label count %d", len(labels))
 	}
 	if len(labels[0]) != 52 || len(labels[1]) != 52 {
 		t.Fatalf("label lengths %d %d", len(labels[0]), len(labels[1]))

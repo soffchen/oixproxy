@@ -79,7 +79,7 @@ func TestDestinationsUseRemoteDNSPolicy(t *testing.T) {
 				continue
 			}
 			id := binary.BigEndian.Uint16(buf[0:2])
-			q, _ := encodeQuery(id, "fusion_hk_1.cloud-nodes.com")
+			q, _ := encodeQuery(id, "n1.example.com")
 			resp := append([]byte{}, q...)
 			binary.BigEndian.PutUint16(resp[2:4], 0x8500)
 			binary.BigEndian.PutUint16(resp[6:8], 1)
@@ -98,9 +98,9 @@ func TestDestinationsUseRemoteDNSPolicy(t *testing.T) {
 	yaml := strings.ReplaceAll(`
 dns:
   proxy-server-nameserver-policy:
-    +.cloud-nodes.com: ['udp://DNSADDR']
+    +.example.com: ['udp://DNSADDR']
 proxies:
-  - { name: "hk 01", type: snell, server: fusion_hk_1.cloud-nodes.com, port: 14888, psk: test-psk, version: 4, reuse: true, obfs-opts: { mode: ech-tls, alpn: snell-ech/1, sni: cover.example, ech-config: AAAA } }
+  - { name: "hk 01", type: snell, server: n1.example.com, port: 14888, psk: test-psk, version: 4, reuse: true, obfs-opts: { mode: ech-tls, alpn: snell-ech/1, sni: cover.example, ech-config: AAAA } }
 `, "DNSADDR", ln.LocalAddr().String())
 	nodes, err := Parse([]byte(yaml))
 	if err != nil {

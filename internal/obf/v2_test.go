@@ -14,8 +14,6 @@ func TestDecodeKnownBlobs(t *testing.T) {
 		"v2:6ZXEUFFYYY0hTyxqxMKLxHX9J6bRCAiy0bLORRMdXWaGcn7Oig==": "X-Anywhere-Response-Signature",
 		"v2:7UHE0sBVsIHWqgb4E0GWuOnUHpMj9Yq0HbmzNQAzx1N14GCXtNjF": "/api/v1/managed/anywhere/direct",
 		"v2:vthOQ13PYKfaGmRQvFRP5GZCmcyG":                         "/api/v1/login",
-		"v2:BeMEuTC7THjx4pV6fBQ/ZGnQkHxujeM=":                     "cloud-nodes.com",
-		"v2:MF9wcQuj4yL5XuoQ40mp22uqNDKrsnej0eg=":                 "124.221.68.73:1053",
 	}
 	for in, want := range cases {
 		got := Decode(in)
@@ -25,5 +23,14 @@ func TestDecodeKnownBlobs(t *testing.T) {
 	}
 	if Decode("plain") != "plain" {
 		t.Fatal("passthrough")
+	}
+	for _, blob := range []string{
+		"v2:BeMEuTC7THjx4pV6fBQ/ZGnQkHxujeM=",
+		"v2:MF9wcQuj4yL5XuoQ40mp22uqNDKrsnej0eg=",
+	} {
+		got := Decode(blob)
+		if got == "" || got == blob {
+			t.Fatalf("blob %s did not decode", blob)
+		}
 	}
 }

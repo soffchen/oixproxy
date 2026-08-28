@@ -13,22 +13,23 @@ func TestLive1053DNSAuthReturnsWorkingIP(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
+	host := os.Getenv("OIX_LIVE_HOST")
+	if host == "" {
+		t.Skip("OIX_LIVE_HOST")
+	}
 	ns := []DNSServer{{Network: "udp", Addr: CloudNodesDNS}}
-	for _, host := range []string{"fusion_hk_1.cloud-nodes.com", "fusion_hk_13.cloud-nodes.com", "fusion_jp_12.cloud-nodes.com"} {
-		ips, err := LookupServers(ctx, host, ns)
-		if err != nil {
-			t.Fatalf("%s: %v", host, err)
-		}
-		if len(ips) == 0 {
-			t.Fatalf("%s empty", host)
-		}
-		got := ips[0].To4()
-		if got == nil {
-			t.Fatalf("%s not v4", host)
-		}
-		if got.String() == "119.40.182.189" {
-			t.Fatalf("%s decoy A from unsigned QNAME", host)
-		}
-		t.Logf("%s resolved to a non-decoy IPv4", host)
+	ips, err := LookupServers(ctx, host, ns)
+	if err != nil {
+		t.Fatal("live DNS-Auth lookup failed")
+	}
+	if len(ips) == 0 {
+		t.Fatal("live DNS-Auth returned no addresses")
+	}
+	got := ips[0].To4()
+	if got == nil {
+		t.Fatal("live DNS-Auth returned a non-IPv4 address")
+	}
+	if got.String() == "119.40.182.189" {
+		t.Fatal("live DNS-Auth returned decoy A from unsigned QNAME")
 	}
 }
