@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 type LANAuth struct {
@@ -149,8 +150,14 @@ func validLANAuth(user, pass string) error {
 	if user == "" || pass == "" {
 		return fmt.Errorf("invalid lanAuth: username and password required")
 	}
-	if strings.ContainsAny(user, "\n\r\x00") || strings.ContainsAny(pass, "\n\r\x00") {
-		return fmt.Errorf("invalid lanAuth: username and password must not contain line breaks")
+	if strings.Contains(user, ":") {
+		return fmt.Errorf("invalid lanAuth: username must not contain colon")
+	}
+	if len(user) > 255 || len(pass) > 255 {
+		return fmt.Errorf("invalid lanAuth: username and password must not exceed 255 bytes")
+	}
+	if strings.ContainsFunc(user, unicode.IsControl) || strings.ContainsFunc(pass, unicode.IsControl) {
+		return fmt.Errorf("invalid lanAuth: username and password must not contain control characters")
 	}
 	return nil
 }

@@ -97,6 +97,61 @@ AdBlock = select, Block, Direct, Proxy
 	}
 }
 
+func TestRewriteReplacesExistingAutoGroupsOnce(t *testing.T) {
+	tmpl := []byte(`[Proxy]
+remote = snell, example.com, 443
+
+[Proxy Group]
+Auto - UrlTest = url-test, remote, url=https://example.com/generate_204, policy-regex-filter="HK,JP", policy-name-filter="HK\",JP", interval=300, tolerance=50, hidden=true
+Auto - Smart = smart, remote, interval=600, include-all-proxies=false
+`)
+	got := RewriteSurge(tmpl, testMaps(), "http://127.0.0.1:6172/", "127.0.0.1")
+	if strings.Count(got, "Auto - UrlTest =") != 1 || strings.Count(got, "Auto - Smart =") != 1 {
+		t.Fatalf("自动组重复定义:\n%s", got)
+	}
+	if strings.Contains(got, "Auto - UrlTest = url-test, remote") || strings.Contains(got, "Auto - Smart = smart, remote") {
+		t.Fatalf("自动组仍引用远端节点:\n%s", got)
+	}
+	for _, option := range []string{
+		"url=https://example.com/generate_204",
+		`policy-regex-filter="HK,JP"`,
+		`policy-name-filter="HK\",JP"`,
+		"interval=300",
+		"tolerance=50",
+		"hidden=true",
+		"interval=600",
+		"include-all-proxies=false",
+	} {
+		if !strings.Contains(got, option) {
+			t.Fatalf("自动组丢失参数 %s:\n%s", option, got)
+		}
+	}
+	for _, name := range []string{"🇭🇰 香港 Fusion 01", "🇯🇵 日本 Fusion 01"} {
+		if !strings.Contains(got, name) {
+			t.Fatalf("自动组缺少 %s:\n%s", name, got)
+		}
+	}
+}
+
+func TestSurgeGroupNames(t *testing.T) {
+	template := []byte(`[Proxy]
+node = socks5, 127.0.0.1, 7200
+
+[Proxy Group]
+# comment
+Domestic = select, node
+AdBlock=select, Block
+domestic = select, Direct
+
+[Rule]
+FINAL,Domestic
+`)
+	names := SurgeGroupNames(template)
+	if len(names) != 2 || names[0] != "Domestic" || names[1] != "AdBlock" {
+		t.Fatalf("names=%v", names)
+	}
+}
+
 func TestSOCKSAuthEmittedPerMapping(t *testing.T) {
 	maps := testMaps()
 	maps[0].User, maps[0].Pass = "alice", "secret"
@@ -119,6 +174,22 @@ func TestSOCKSAuthEmittedPerMapping(t *testing.T) {
 	surge := SurgeConfig(maps, "http://203.0.113.10:6172/", host, nil)
 	if !strings.Contains(surge, "🇭🇰 香港 Fusion 01 = socks5, 203.0.113.10, 7200, alice, secret, udp-relay=true") {
 		t.Fatalf("surge auth: %s", surge)
+	}
+}
+
+func TestMappingCanAdvertiseItsBoundHost(t *testing.T) {
+	maps := testMaps()
+	maps[0].Host = "192.0.2.10"
+	list := ProxyList(maps, "203.0.113.10")
+	if !strings.Contains(list, "🇭🇰 香港 Fusion 01 = socks5, 192.0.2.10, 7200") {
+		t.Fatalf("固定监听地址未写入列表: %s", list)
+	}
+	if !strings.Contains(list, "🇯🇵 日本 Fusion 01 = socks5, 203.0.113.10, 7201") {
+		t.Fatalf("默认监听地址未使用请求 Host: %s", list)
+	}
+	clash := ClashConfig(maps, "203.0.113.10")
+	if !strings.Contains(clash, "server: 192.0.2.10") || !strings.Contains(clash, "server: 203.0.113.10") {
+		t.Fatalf("Clash 地址错误: %s", clash)
 	}
 }
 

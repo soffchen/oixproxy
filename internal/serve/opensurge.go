@@ -76,9 +76,17 @@ func OpenSurgeConfig(clashURL, processName, processPath string) string {
 }
 
 func clashInspectURL(listen, user, pass string) string {
-	port := portOf(listen)
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		host = "127.0.0.1"
+		port = portOf(listen)
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "127.0.0.1"
+	}
 	u := url.URL{Scheme: "http", Path: "/clash"}
-	u.Host = net.JoinHostPort("127.0.0.1", port)
+	u.Host = net.JoinHostPort(host, port)
 	if user != "" {
 		u.User = url.UserPassword(user, pass)
 	}

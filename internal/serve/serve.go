@@ -20,6 +20,7 @@ import (
 type Mapping struct {
 	Node dialer.Node
 	Port int
+	Host string
 	// UDP is ASSOCIATE + profile advertise for this listener.
 	UDP  bool
 	User string
@@ -30,6 +31,7 @@ type Mapping struct {
 type DialFunc func(ctx context.Context, n dialer.Node, network, host string, port uint16) (net.Conn, error)
 
 type Extra struct {
+	Name string
 	Node dialer.Node
 	Addr string
 }
@@ -56,6 +58,7 @@ type Server struct {
 	poolByName map[string]*dialer.Pool
 	httpLn     net.Listener
 	httpSrv    *http.Server
+	closed     bool
 }
 
 func (s *Server) Mappings() []Mapping {
@@ -67,6 +70,7 @@ func (s *Server) Mappings() []Mapping {
 }
 
 func (s *Server) Start() error {
+	s.closed = false
 	if s.Bind == "" {
 		s.Bind = "127.0.0.1"
 	}
@@ -110,10 +114,19 @@ func (s *Server) Start() error {
 			s.Close()
 			return fmt.Errorf("listen %s: %w", extra.Addr, err)
 		}
-		_, ps, _ := net.SplitHostPort(extra.Addr)
-		port, _ := strconv.Atoi(ps)
-		s.maps = append(s.maps, Mapping{Node: extra.Node, Port: port, UDP: udp != nil, User: u, Pass: p, ln: ln})
-		log.Printf("mapped %s -> %s", extra.Node.Name, extra.Addr)
+		boundAddr, ok := ln.Addr().(*net.TCPAddr)
+		if !ok {
+			_ = ln.Close()
+			s.Close()
+			return fmt.Errorf("监听 %s: 非预期地址类型 %T", extra.Addr, ln.Addr())
+		}
+		host := tcpAddrHost(boundAddr)
+		mappedNode := extra.Node
+		if extra.Name != "" {
+			mappedNode.Name = extra.Name
+		}
+		s.maps = append(s.maps, Mapping{Node: mappedNode, Port: boundAddr.Port, Host: host, UDP: udp != nil, User: u, Pass: p, ln: ln})
+		log.Printf("mapped %s -> %s", mappedNode.Name, extra.Addr)
 	}
 
 	if s.NoHTTP {
@@ -138,7 +151,12 @@ func (s *Server) Start() error {
 	}
 	s.httpLn = ln
 	s.Listen = ln.Addr().String()
-	s.httpSrv = &http.Server{Handler: mux}
+	s.httpSrv = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	log.Printf("config server http://%s  (/ /clash /list /opensurge /health)", s.Listen)
 	body := s.openSurgeBody()
 	if s.OpenSurgePath != "" {
@@ -148,8 +166,9 @@ func (s *Server) Start() error {
 			log.Printf("OpenSurge profile → %s", s.OpenSurgePath)
 		}
 	}
+	httpSrv := s.httpSrv
 	go func() {
-		if err := s.httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("config server: %v", err)
 		}
 	}()
@@ -228,25 +247,54 @@ func (s *Server) handleOpenSurge(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) Close() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.httpSrv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = s.httpSrv.Shutdown(ctx)
-		cancel()
+	if s.closed {
+		s.mu.Unlock()
+		return
 	}
-	if s.httpLn != nil {
-		_ = s.httpLn.Close()
-	}
-	for _, m := range s.maps {
+	s.closed = true
+	httpSrv := s.httpSrv
+	s.httpSrv = nil
+	httpLn := s.httpLn
+	s.httpLn = nil
+	maps := append([]Mapping(nil), s.maps...)
+	pools := append([]*dialer.Pool(nil), s.pools...)
+	s.pools = nil
+	s.poolByName = nil
+	s.mu.Unlock()
+
+	for _, m := range maps {
 		if m.ln != nil {
 			_ = m.ln.Close()
 		}
 	}
-	for _, p := range s.pools {
+	if httpSrv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := httpSrv.Shutdown(ctx); err != nil {
+			log.Printf("config server shutdown: %v", err)
+			_ = httpSrv.Close()
+		}
+		cancel()
+	}
+	if httpLn != nil {
+		_ = httpLn.Close()
+	}
+	for _, p := range pools {
 		p.Close()
 	}
-	s.pools = nil
-	s.poolByName = nil
+	s.mu.Lock()
+	s.maps = nil
+	s.mu.Unlock()
+}
+
+func tcpAddrHost(addr *net.TCPAddr) string {
+	if addr.IP.IsUnspecified() {
+		return ""
+	}
+	host := addr.IP.String()
+	if addr.Zone != "" {
+		host += "%" + addr.Zone
+	}
+	return host
 }
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {

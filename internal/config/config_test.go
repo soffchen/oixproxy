@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -66,6 +67,29 @@ func TestLoadRejectsLANAuthLineBreaks(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected line break rejected")
+	}
+}
+
+func TestLANAuthRejectsProtocolIncompatibleCredentials(t *testing.T) {
+	tests := []struct {
+		name string
+		user string
+		pass string
+	}{
+		{name: "用户名含冒号", user: "al:ice", pass: "secret"},
+		{name: "用户名超过 255 字节", user: strings.Repeat("u", 256), pass: "secret"},
+		{name: "密码超过 255 字节", user: "alice", pass: strings.Repeat("p", 256)},
+		{name: "密码含控制字符", user: "alice", pass: "sec\x01ret"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validLANAuth(tt.user, tt.pass); err == nil {
+				t.Fatal("期望拒绝 HTTP Basic 或 SOCKS5 无法表示的凭据")
+			}
+		})
+	}
+	if err := validLANAuth(strings.Repeat("u", 255), strings.Repeat("p", 255)); err != nil {
+		t.Fatalf("255 字节凭据应有效: %v", err)
 	}
 }
 

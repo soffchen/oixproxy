@@ -165,7 +165,7 @@ Surge 首次要求安装时确认，然后开启 `Set as System Proxy`。
 }
 ```
 
-`type` 可选 `mixed`、`socks5`、`http`，默认 `mixed`。本程序的额外端口目前一律按 mixed（SOCKS5 + HTTP CONNECT）监听。
+`name` 必填且不能与基础节点、其它监听器或 `Direct` / `Block` / `Proxy` 等生成配置保留名重名，也不能包含换行、逗号或等号；配置中的节点、名称或端口无效时程序会拒绝启动。`type` 可选 `mixed`、`socks5`、`http`，默认 `mixed`。本程序的额外端口目前一律按 mixed（SOCKS5 + HTTP CONNECT）监听。
 
 ## 配置文件
 
@@ -313,7 +313,7 @@ OIX_LIVE_SOCKS=1 OIX_PROFILE=/path/to/your-dedicated.yaml go test ./internal/run
 
 ## 编译
 
-需要 Go 1.26+。默认关闭 CGO，便于交叉编译。
+需要 Go 1.26.7+。默认关闭 CGO，便于交叉编译。
 
 ```bash
 go build -o oixproxy ./cmd/oixproxy

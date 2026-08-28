@@ -2,9 +2,11 @@ package inbound
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -37,7 +39,12 @@ type udpHub struct {
 
 func newUDPHub(pc net.PacketConn) *udpHub {
 	h := &udpHub{pc: pc, byClient: map[string]*udpSess{}}
-	go h.readLoop()
+	go func() {
+		if err := h.readLoop(); err != nil {
+			log.Printf("UDP 监听 %s 已停止: %v", h.LocalAddr(), err)
+			_ = h.Close()
+		}
+	}()
 	return h
 }
 
@@ -92,24 +99,24 @@ func (h *udpHub) clientOf(s *udpSess) net.Addr {
 	return s.client
 }
 
-func (h *udpHub) readLoop() {
+func (h *udpHub) readLoop() error {
 	buf := make([]byte, 64*1024)
-	var nerr int
+	var retryDelay time.Duration
 	for {
 		n, from, err := h.pc.ReadFrom(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
-				return
+				return nil
 			}
-			log.Printf("udp read: %v", err)
-			nerr++
-			if nerr > 50 {
-				return
+			if !retryablePacketReadError(err) {
+				return fmt.Errorf("udp read: %w", err)
 			}
-			time.Sleep(5 * time.Millisecond)
+			retryDelay = nextRetryDelay(retryDelay)
+			log.Printf("udp read: %v，%s 后重试", err, retryDelay)
+			time.Sleep(retryDelay)
 			continue
 		}
-		nerr = 0
+		retryDelay = 0
 		host, port, payload, err := parseSOCKSUDP(buf[:n])
 		if err != nil {
 			continue
@@ -130,6 +137,13 @@ func (h *udpHub) readLoop() {
 		case <-s.done:
 		}
 	}
+}
+
+func retryablePacketReadError(err error) bool {
+	return retryableNetworkError(err) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ENOBUFS)
 }
 
 func (h *udpHub) dispatch(from net.Addr) *udpSess {

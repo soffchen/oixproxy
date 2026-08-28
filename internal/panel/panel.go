@@ -3,8 +3,10 @@ package panel
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,6 +25,8 @@ import (
 // DefaultBase is the panel host used by oixcloud-external-proxy-program
 // (POST /api/v1/information and /api/v1/managed/surge).
 const DefaultBase = "https://oixcloud.com"
+
+const maxPanelBody = 8 << 20
 
 type Client struct {
 	Base         string
@@ -67,7 +71,7 @@ func (c *Client) postForm(path string, form url.Values) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
+	b, err := readLimitedBody(resp.Body, maxPanelBody)
 	if err != nil {
 		return nil, err
 	}
@@ -140,16 +144,25 @@ func (c *Client) Fetch() ([]dialer.Node, []byte, error) {
 		return nil, nil, err
 	}
 	var nodes []dialer.Node
+	var anywhereErr error
 	if n, _, err := c.fetchAnywhere(); err == nil {
 		nodes = n
+	} else {
+		anywhereErr = err
 	}
 	tmplNodes, tmpl, tmplErr := c.fetchSurgeTemplate()
+	if anywhereErr != nil && len(tmplNodes) > 0 {
+		log.Printf("专属节点接口不可用，改用 Surge 模板: %v", anywhereErr)
+	}
+	if tmplErr != nil && len(nodes) > 0 {
+		log.Printf("Surge 模板不可用，改用最小配置: %v", tmplErr)
+	}
 	if len(nodes) == 0 {
 		nodes = tmplNodes
 	}
 	if len(nodes) == 0 {
-		if tmplErr != nil {
-			return nil, tmpl, tmplErr
+		if anywhereErr != nil || tmplErr != nil {
+			return nil, tmpl, errors.Join(anywhereErr, tmplErr)
 		}
 		return nil, tmpl, fmt.Errorf("no snell ech-tls nodes")
 	}
@@ -205,7 +218,7 @@ func (c *Client) getSigned(host, path, ts, pub, ua, hTS, hSig, hAge string) ([]b
 		return nil, nil, err
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
+	b, err := readLimitedBody(resp.Body, maxPanelBody)
 	if err != nil {
 		return nil, resp.Header, err
 	}
@@ -319,12 +332,17 @@ func (c *Client) fetchSurgeTemplate() ([]dialer.Node, []byte, error) {
 	}
 
 	dl := c.dedicatedDownloadURL(smart)
+	var downloadErr error
 	if dl != "" {
 		if body, err := c.get(dl); err == nil {
 			bodies = append(bodies, body)
-			if nodes, err := profile.Parse(body); err == nil {
+			if nodes, parseErr := profile.Parse(body); parseErr == nil {
 				return nodes, pickTemplate(bodies, body), nil
+			} else {
+				downloadErr = fmt.Errorf("subscription parse: %w", parseErr)
 			}
+		} else {
+			downloadErr = fmt.Errorf("subscription download: %w", err)
 		}
 	}
 
@@ -332,21 +350,24 @@ func (c *Client) fetchSurgeTemplate() ([]dialer.Node, []byte, error) {
 	if nodes, err := profile.Parse(tmpl); err == nil {
 		return nodes, tmpl, nil
 	}
-	return nil, tmpl, nil
+	if downloadErr != nil {
+		return nil, tmpl, downloadErr
+	}
+	return nil, tmpl, fmt.Errorf("no snell ech-tls nodes in Surge template")
 }
 
 func (c *Client) get(rawURL string) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid subscription URL")
 	}
 	req.Header.Set("User-Agent", anywhereUA)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, redactRequestError(err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readLimitedBody(resp.Body, maxPanelBody)
 	if err != nil {
 		return nil, err
 	}
@@ -354,6 +375,14 @@ func (c *Client) get(rawURL string) ([]byte, error) {
 		return nil, fmt.Errorf("subscription HTTP %d", resp.StatusCode)
 	}
 	return body, nil
+}
+
+func redactRequestError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("%s: %w", urlErr.Op, urlErr.Err)
+	}
+	return err
 }
 
 // FetchDedicatedNodes logs in, downloads the dedicated payload, and parses snell+ech-tls nodes.
@@ -481,4 +510,15 @@ func truncate(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "..."
+}
+
+func readLimitedBody(r io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("response body exceeds %d bytes", limit)
+	}
+	return b, nil
 }

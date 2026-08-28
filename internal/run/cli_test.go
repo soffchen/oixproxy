@@ -38,6 +38,10 @@ func TestLoadNodesAppliesFilter(t *testing.T) {
 	if len(nodes) != 1 || !strings.Contains(nodes[0].Name, "日本") {
 		t.Fatalf("filtered %+v", nodes)
 	}
+	raw, _, err := loadNodesRaw(config.File{Filter: "日本"}, p)
+	if err != nil || len(raw) != 2 {
+		t.Fatalf("raw nodes %d err=%v", len(raw), err)
+	}
 	_, _, err = LoadNodes(config.File{Filter: "不存在的区域"}, p)
 	if err == nil || !strings.Contains(err.Error(), "matched no nodes") {
 		t.Fatalf("empty match err %v", err)
@@ -76,8 +80,9 @@ func TestCLIServeFalseSkipsHTTP(t *testing.T) {
 	if err := os.WriteFile(prof, []byte(snellFixture), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	httpPort := freePort(t)
-	mapPort := freePort(t)
+	ports := freePortRange(t, 3)
+	httpPort := ports
+	mapPort := ports + 1
 	ready := filepath.Join(t.TempDir(), "ready")
 	cmd := exec.Command(bin, "--profile", prof, "--listen", "127.0.0.1:"+strconv.Itoa(httpPort), "--bind", "127.0.0.1", "--map", "--map-base-port", strconv.Itoa(mapPort), "--serve=false")
 	cmd.Env = append(os.Environ(), "OIXPROXY_READY_FILE="+ready, "OIXCLOUD_DATA="+t.TempDir())
@@ -128,8 +133,9 @@ func TestCLIFilterMapsOnlyMatches(t *testing.T) {
 	if err := os.WriteFile(prof, []byte(snellFixture), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	httpPort := freePort(t)
-	mapPort := freePort(t)
+	ports := freePortRange(t, 3)
+	httpPort := ports
+	mapPort := ports + 1
 	ready := filepath.Join(t.TempDir(), "ready")
 	cmd := exec.Command(bin, "--profile", prof, "--listen", "127.0.0.1:"+strconv.Itoa(httpPort), "--bind", "127.0.0.1", "--map", "--map-base-port", strconv.Itoa(mapPort), "--filter", "日本")
 	cmd.Env = append(os.Environ(), "OIXPROXY_READY_FILE="+ready, "OIXCLOUD_DATA="+t.TempDir())
@@ -229,8 +235,9 @@ func TestCLILaunchTwiceAgainstStubPanel(t *testing.T) {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
 
-	httpPort := freePort(t)
-	mapPort := freePort(t)
+	ports := freePortRange(t, 3)
+	httpPort := ports
+	mapPort := ports + 1
 	cfg := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(cfg, []byte(`{"accessToken":"test-access-key","apiBase":"`+ts.URL+`","proxyMode":"map","servePort":`+strconv.Itoa(httpPort)+`,"mapBasePort":`+strconv.Itoa(mapPort)+`,"listenAddress":"127.0.0.1"}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -341,15 +348,33 @@ func moduleRoot(t *testing.T) string {
 	}
 }
 
-func freePort(t *testing.T) int {
+func freePortRange(t *testing.T, count int) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for attempt := 0; attempt < 100; attempt++ {
+		first, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := first.Addr().(*net.TCPAddr).Port
+		listeners := []net.Listener{first}
+		ok := base+count-1 <= 65535
+		for i := 1; ok && i < count; i++ {
+			ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(base+i))
+			if err != nil {
+				ok = false
+				break
+			}
+			listeners = append(listeners, ln)
+		}
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
+		if ok {
+			return base
+		}
 	}
-	p := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
-	return p
+	t.Fatal("no contiguous free port range")
+	return 0
 }
 
 func evidenceDir() string {

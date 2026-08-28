@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -20,6 +21,12 @@ type Handler func(network, host string, port uint16) (net.Conn, error)
 
 // UDPDialer opens a snell UDP session. Nil means UDP ASSOCIATE is rejected.
 type UDPDialer func() (net.PacketConn, error)
+
+const (
+	proxyHandshakeTimeout = 30 * time.Second
+	retryInitialDelay     = 5 * time.Millisecond
+	retryMaxDelay         = time.Second
+)
 
 type mixedListener struct {
 	net.Listener
@@ -59,29 +66,34 @@ func ListenMixed(addr string, user, pass string, h Handler, udp UDPDialer) (net.
 		}
 		ml.hub = newUDPHub(pc)
 	}
-	go AcceptLoop(ml, user, pass, h, udp)
+	go func() {
+		if err := AcceptLoop(ml, user, pass, h, udp); err != nil {
+			log.Printf("代理监听 %s 已停止: %v", ml.Addr(), err)
+			_ = ml.Close()
+		}
+	}()
 	return ml, nil
 }
 
 // AcceptLoop serves mixed SOCKS5/HTTP on ln until it is closed.
-func AcceptLoop(ln net.Listener, user, pass string, h Handler, udp UDPDialer) {
+func AcceptLoop(ln net.Listener, user, pass string, h Handler, udp UDPDialer) error {
 	hub := listenerHub(ln)
-	var nerr int
+	var retryDelay time.Duration
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
-				return
+				return nil
 			}
-			log.Printf("accept: %v", err)
-			nerr++
-			if nerr > 50 {
-				return
+			if !retryableNetworkError(err) {
+				return fmt.Errorf("accept: %w", err)
 			}
-			time.Sleep(5 * time.Millisecond)
+			retryDelay = nextRetryDelay(retryDelay)
+			log.Printf("accept: %v，%s 后重试", err, retryDelay)
+			time.Sleep(retryDelay)
 			continue
 		}
-		nerr = 0
+		retryDelay = 0
 		go func(c net.Conn) {
 			defer c.Close()
 			if err := serve(c, user, pass, h, udp, hub); err != nil && err != io.EOF && err != net.ErrClosed {
@@ -91,12 +103,23 @@ func AcceptLoop(ln net.Listener, user, pass string, h Handler, udp UDPDialer) {
 	}
 }
 
+func retryableNetworkError(err error) bool {
+	if errors.Is(err, syscall.ENOBUFS) || errors.Is(err, syscall.ENOMEM) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
+}
+
 // Handle serves one mixed SOCKS5/HTTP client connection.
 func Handle(c net.Conn, user, pass string, h Handler, udp UDPDialer) error {
 	return serve(c, user, pass, h, udp, nil)
 }
 
 func serve(c net.Conn, user, pass string, h Handler, udp UDPDialer, hub *udpHub) error {
+	if err := c.SetDeadline(time.Now().Add(proxyHandshakeTimeout)); err != nil {
+		return fmt.Errorf("设置代理握手超时: %w", err)
+	}
 	br := bufio.NewReader(c)
 	b, err := br.Peek(1)
 	if err != nil {
@@ -119,20 +142,20 @@ func serveSOCKS(br *bufio.Reader, c net.Conn, user, pass string, h Handler, udp 
 		return err
 	}
 	needAuth := user != ""
-	chosen := byte(0x00)
+	wantMethod := byte(0x00)
 	if needAuth {
-		chosen = 0x02
-		ok := false
-		for _, m := range methods {
-			if m == 0x02 {
-				ok = true
-				break
-			}
+		wantMethod = 0x02
+	}
+	chosen := byte(0xff)
+	for _, m := range methods {
+		if m == wantMethod {
+			chosen = wantMethod
+			break
 		}
-		if !ok {
-			_, _ = c.Write([]byte{0x05, 0xff})
-			return fmt.Errorf("socks auth required")
-		}
+	}
+	if chosen == 0xff {
+		_, _ = c.Write([]byte{0x05, 0xff})
+		return fmt.Errorf("socks authentication method unavailable")
 	}
 	if _, err := c.Write([]byte{0x05, chosen}); err != nil {
 		return err
@@ -141,6 +164,10 @@ func serveSOCKS(br *bufio.Reader, c net.Conn, user, pass string, h Handler, udp 
 		var authHdr [2]byte
 		if _, err := io.ReadFull(br, authHdr[:]); err != nil {
 			return err
+		}
+		if authHdr[0] != 0x01 {
+			_, _ = c.Write([]byte{0x01, 0x01})
+			return fmt.Errorf("socks auth version %d", authHdr[0])
 		}
 		ulen := int(authHdr[1])
 		ubuf := make([]byte, ulen)
@@ -168,13 +195,16 @@ func serveSOCKS(br *bufio.Reader, c net.Conn, user, pass string, h Handler, udp 
 	if _, err := io.ReadFull(br, req[:]); err != nil {
 		return err
 	}
-	if req[0] != 0x05 {
+	if req[0] != 0x05 || req[2] != 0x00 {
 		return fmt.Errorf("socks version %d", req[0])
 	}
 	if req[1] == 0x03 {
 		host, port, err := readSOCKSAddr(br, req[3])
 		if err != nil {
 			return err
+		}
+		if err := c.SetDeadline(time.Time{}); err != nil {
+			return fmt.Errorf("清除代理握手超时: %w", err)
 		}
 		return serveUDPAssociate(c, br, udp, hub, associateExpect(host, port))
 	}
@@ -192,6 +222,9 @@ func serveSOCKS(br *bufio.Reader, c net.Conn, user, pass string, h Handler, udp 
 		return err
 	}
 	defer up.Close()
+	if err := c.SetDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("清除代理握手超时: %w", err)
+	}
 	if _, err := c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
 		return err
 	}
@@ -256,6 +289,9 @@ func serveHTTP(br *bufio.Reader, c net.Conn, user, pass string, h Handler) error
 			return err
 		}
 		defer up.Close()
+		if err := c.SetDeadline(time.Time{}); err != nil {
+			return fmt.Errorf("清除代理握手超时: %w", err)
+		}
 		if _, err := c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 			return err
 		}
@@ -277,17 +313,29 @@ func splitHostPort(hp string, def uint16) (string, uint16, error) {
 	if err != nil {
 		return "", 0, err
 	}
+	if p < 1 || p > 65535 {
+		return "", 0, fmt.Errorf("invalid port %d", p)
+	}
 	return host, uint16(p), nil
 }
 
 func parseBasic(h string) (string, string, bool) {
-	const p = "Basic "
-	if !strings.HasPrefix(h, p) && !strings.HasPrefix(h, "basic ") {
+	scheme, encoded, ok := strings.Cut(strings.TrimSpace(h), " ")
+	if !ok || !strings.EqualFold(scheme, "Basic") {
 		return "", "", false
 	}
-	// std library already decoded? no, still base64. Keep simple: split after decode in caller if needed.
-	// Use http's built-in via a dummy request? Skip, decode here.
-	return parseBasicB64(strings.TrimSpace(h[len(p):]))
+	return parseBasicB64(strings.TrimSpace(encoded))
+}
+
+func nextRetryDelay(current time.Duration) time.Duration {
+	if current <= 0 {
+		return retryInitialDelay
+	}
+	next := current * 2
+	if next > retryMaxDelay {
+		return retryMaxDelay
+	}
+	return next
 }
 
 func parseBasicB64(s string) (string, string, bool) {

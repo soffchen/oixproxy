@@ -3,8 +3,10 @@ package inbound
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strconv"
 )
@@ -45,7 +47,13 @@ func serveUDPAssociate(tcp net.Conn, br *bufio.Reader, udp UDPDialer, hub *udpHu
 			if dst == nil {
 				continue
 			}
-			_, _ = hub.WriteTo(encodeSOCKSUDP(addr, buf[:n]), dst)
+			if _, err := hub.WriteTo(encodeSOCKSUDP(addr, buf[:n]), dst); err != nil {
+				if !errors.Is(err, net.ErrClosed) {
+					log.Printf("socks udp 回复客户端: %v", err)
+				}
+				sess.stop()
+				return
+			}
 		}
 	}()
 	go func() {
@@ -58,7 +66,13 @@ func serveUDPAssociate(tcp net.Conn, br *bufio.Reader, udp UDPDialer, hub *udpHu
 			if !ok {
 				return nil
 			}
-			_, _ = up.WriteTo(d.payload, d.dest)
+			n, err := up.WriteTo(d.payload, d.dest)
+			if err != nil {
+				return fmt.Errorf("socks udp 写入上游 %s: %w", d.dest, err)
+			}
+			if n != len(d.payload) {
+				return fmt.Errorf("socks udp 写入上游 %s: %w", d.dest, io.ErrShortWrite)
+			}
 		case <-sess.done:
 			return nil
 		}

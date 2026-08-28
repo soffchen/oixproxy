@@ -236,6 +236,25 @@ func TestTLSDropDoesNotSetPeerClosed(t *testing.T) {
 	}
 }
 
+func BenchmarkV4WriterWrite32K(b *testing.B) {
+	w, err := newWriter(io.Discard, []byte("benchmark-psk"), nil, 1)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := w.Write([]byte("warmup")); err != nil {
+		b.Fatal(err)
+	}
+	payload := make([]byte, 32*1024)
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := w.Write(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func pipeConns(t *testing.T) (client, peer *Conn) {
 	t.Helper()
 	a, b := net.Pipe()

@@ -61,7 +61,7 @@ func upgradeWebsocket(ctx context.Context, conn net.Conn, n Node) (net.Conn, err
 	accept := resp.Header.Get("Sec-WebSocket-Accept")
 	sum := sha1.Sum([]byte(secKey + wsGUID))
 	want := base64.StdEncoding.EncodeToString(sum[:])
-	if accept != "" && accept != want {
+	if accept != want {
 		return nil, fmt.Errorf("websocket accept mismatch")
 	}
 	return newWSConn(conn, br), nil
@@ -147,7 +147,9 @@ func (c *wsConn) readFrame() ([]byte, error) {
 	case 0x8:
 		return nil, io.EOF
 	case 0x9:
-		_ = c.writeFrame(0xA, payload)
+		if err := c.writeLockedFrame(0xA, payload); err != nil {
+			return nil, fmt.Errorf("websocket pong: %w", err)
+		}
 		return nil, nil
 	case 0xA:
 		return nil, nil
@@ -159,12 +161,16 @@ func (c *wsConn) readFrame() ([]byte, error) {
 }
 
 func (c *wsConn) Write(p []byte) (int, error) {
-	c.writeM.Lock()
-	defer c.writeM.Unlock()
-	if err := c.writeFrame(0x2, p); err != nil {
+	if err := c.writeLockedFrame(0x2, p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+func (c *wsConn) writeLockedFrame(opcode byte, payload []byte) error {
+	c.writeM.Lock()
+	defer c.writeM.Unlock()
+	return c.writeFrame(opcode, payload)
 }
 
 func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
@@ -202,8 +208,6 @@ func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
 }
 
 func (c *wsConn) Close() error {
-	c.writeM.Lock()
-	_ = c.writeFrame(0x8, []byte{0x03, 0xe8})
-	c.writeM.Unlock()
+	_ = c.writeLockedFrame(0x8, []byte{0x03, 0xe8})
 	return c.Conn.Close()
 }

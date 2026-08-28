@@ -52,6 +52,20 @@ func TestOpenSurgeLANAuthInProviderURL(t *testing.T) {
 	}
 }
 
+func TestClashInspectURLPreservesReachableListener(t *testing.T) {
+	tests := map[string]string{
+		"[::1]:6172":       "http://[::1]:6172/clash",
+		"[::]:6172":        "http://127.0.0.1:6172/clash",
+		"0.0.0.0:6172":     "http://127.0.0.1:6172/clash",
+		"192.168.1.9:6172": "http://192.168.1.9:6172/clash",
+	}
+	for listen, want := range tests {
+		if got := clashInspectURL(listen, "", ""); got != want {
+			t.Fatalf("%s: got %s want %s", listen, got, want)
+		}
+	}
+}
+
 func TestWriteOpenSurgeFilePerms(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "OpenSurge.yaml")

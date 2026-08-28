@@ -2,8 +2,10 @@ package snell
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"testing"
+	"time"
 )
 
 func TestUDPRequestIPv4RoundTripShape(t *testing.T) {
@@ -42,5 +44,68 @@ func TestUDPResponseParse(t *testing.T) {
 	}
 	if !bytes.Equal(payload, []byte{9, 9}) {
 		t.Fatalf("%x", payload)
+	}
+}
+
+func TestPacketConnRoundTrip(t *testing.T) {
+	client, peer := pipeConns(t)
+	errCh := make(chan error, 1)
+	go func() {
+		if err := peer.initReader(); err != nil {
+			errCh <- err
+			return
+		}
+		header, err := peer.r.readFrame()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if len(header) != 3 || header[0] != headerVersion || header[1] != cmdUDP {
+			errCh <- io.ErrUnexpectedEOF
+			return
+		}
+		replyDone := make(chan error, 1)
+		go func() {
+			_, err := peer.Write([]byte{cmdTunnel})
+			replyDone <- err
+		}()
+		request, err := peer.r.readFrame()
+		if err != nil || len(request) == 0 || request[0] != cmdUDPForward {
+			if err == nil {
+				err = io.ErrUnexpectedEOF
+			}
+			errCh <- err
+			return
+		}
+		if err := <-replyDone; err != nil {
+			errCh <- err
+			return
+		}
+		response := []byte{0x04, 1, 1, 1, 1, 0, 53, 'o', 'k'}
+		_, err = peer.WritePacket(response)
+		errCh <- err
+	}()
+	if err := client.WriteUDP(); err != nil {
+		t.Fatal(err)
+	}
+	pc := NewPacketConn(client)
+	if _, err := pc.WriteTo([]byte("query"), &net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 53}); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	n, addr, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "ok" || addr.String() != "1.1.1.1:53" {
+		t.Fatalf("reply %q from %v", buf[:n], addr)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("peer 未完成 UDP round trip")
 	}
 }

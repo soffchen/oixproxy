@@ -1,6 +1,6 @@
 module github.com/soffchen/oixproxy
 
-go 1.26.5
+go 1.26.7
 
 require (
 	filippo.io/age v1.2.1
@@ -13,7 +13,7 @@ require (
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
-	github.com/klauspost/compress v1.17.9 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 	golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )

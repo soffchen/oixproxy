@@ -3,6 +3,7 @@ package panel
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -209,6 +210,71 @@ func TestFetchAgeEncryptedInlineConfig(t *testing.T) {
 	}
 	if len(nodes) != 2 {
 		t.Fatalf("nodes %d", len(nodes))
+	}
+}
+
+func TestFetchAnywhereRejectsBadResponseSignature(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/managed/anywhere/direct", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(hdrResponseSig(), "invalid-signature")
+		cfg, _ := json.Marshal(snellYAML)
+		_, _ = w.Write([]byte(`{"ret":200,"config":` + string(cfg) + `}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	c := New("test-access-key")
+	c.Base = ts.URL
+	c.IdentityPath = filepath.Join(t.TempDir(), ".identity")
+	if _, _, err := c.fetchAnywhere(); err == nil || !strings.Contains(err.Error(), "signature mismatch") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestFetchSurgeTemplateReturnsDownloadError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/managed/surge", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ret":200,"smart":"/download?dedicated_access=x"}`))
+	})
+	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	c := New("test-access-key")
+	c.Base = ts.URL
+	if _, _, err := c.fetchSurgeTemplate(); err == nil || !strings.Contains(err.Error(), "subscription download") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestReadLimitedBodyRejectsOversize(t *testing.T) {
+	if _, err := readLimitedBody(strings.NewReader("12345"), 4); err == nil {
+		t.Fatal("超限响应体应失败")
+	}
+	b, err := readLimitedBody(strings.NewReader("1234"), 4)
+	if err != nil || string(b) != "1234" {
+		t.Fatalf("body=%q err=%v", b, err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestSubscriptionRequestErrorRedactsDedicatedAccess(t *testing.T) {
+	want := errors.New("dial failed")
+	c := New("test-access-key")
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, want
+	})}
+	_, err := c.get("https://example.com/download?dedicated_access=secret-value&other=1")
+	if !errors.Is(err, want) {
+		t.Fatalf("err=%v want=%v", err, want)
+	}
+	if strings.Contains(err.Error(), "secret-value") || strings.Contains(err.Error(), "dedicated_access") {
+		t.Fatalf("下载凭据泄露到错误: %v", err)
 	}
 }
 

@@ -2,6 +2,7 @@
 /oixproxy
 /oixproxy-*
 /cmd/oixproxy/oixproxy
+/dist/
 
 # local secrets and runtime
 config.json

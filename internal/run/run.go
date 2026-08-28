@@ -1,6 +1,7 @@
 package run
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/soffchen/oixproxy/internal/config"
 	"github.com/soffchen/oixproxy/internal/dialer"
@@ -117,7 +119,11 @@ func Main(args []string) error {
 		cfg.Filter = *filterFlag
 	}
 
-	nodes, tmpl, err := LoadNodes(cfg, *profilePath)
+	allNodes, tmpl, err := loadNodesRaw(cfg, *profilePath)
+	if err != nil {
+		return err
+	}
+	nodes, err := filterNodes(allNodes, cfg.Filter)
 	if err != nil {
 		return err
 	}
@@ -145,6 +151,10 @@ func Main(args []string) error {
 		nodes = nodes[:1]
 	}
 	httpUser, httpPass := cfg.AuthFor(listenAddr)
+	extras, err := extraListeners(cfg, nodes, allNodes, tmpl, bindAddr)
+	if err != nil {
+		return err
+	}
 
 	exe, _ := os.Executable()
 	srv := &serve.Server{
@@ -156,7 +166,7 @@ func Main(args []string) error {
 		Auth:          cfg.AuthFor,
 		NoHTTP:        !*serveHTTP,
 		Nodes:         nodes,
-		Extras:        extraListeners(cfg, nodes, bindAddr),
+		Extras:        extras,
 		Template:      tmpl,
 		OpenSurgePath: filepath.Join(cfg.DataDir, "OpenSurge.yaml"),
 		ProcessName:   filepath.Base(os.Args[0]),
@@ -176,24 +186,68 @@ func Main(args []string) error {
 	return nil
 }
 
-func extraListeners(cfg config.File, nodes []dialer.Node, bind string) []serve.Extra {
+func extraListeners(cfg config.File, nodes, allNodes []dialer.Node, template []byte, bind string) ([]serve.Extra, error) {
+	if cfg.ProxyMode != "map" {
+		return nil, nil
+	}
 	var out []serve.Extra
-	for _, l := range cfg.Listeners {
-		if l.Port <= 0 {
-			continue
+	seenNames := make(map[string]struct{}, len(allNodes)+len(cfg.Listeners))
+	for _, n := range allNodes {
+		seenNames[policyNameKey(n.Name)] = struct{}{}
+	}
+	for _, name := range serve.SurgeGroupNames(template) {
+		seenNames[policyNameKey(name)] = struct{}{}
+	}
+	for i, l := range cfg.Listeners {
+		name := strings.TrimSpace(l.Name)
+		if err := validateListenerName(name); err != nil {
+			return nil, fmt.Errorf("listeners[%d].name: %w", i, err)
+		}
+		nameKey := policyNameKey(name)
+		if _, exists := seenNames[nameKey]; exists {
+			return nil, fmt.Errorf("duplicate listener name %q", name)
+		}
+		if l.Port < 1 || l.Port > 65535 {
+			return nil, fmt.Errorf("listeners[%d].port %d is invalid", i, l.Port)
+		}
+		if _, err := Find(allNodes, l.Node); err != nil {
+			return nil, fmt.Errorf("listeners[%d]: %w", i, err)
 		}
 		n, err := Find(nodes, l.Node)
 		if err != nil {
-			log.Printf("listeners: %v", err)
+			seenNames[nameKey] = struct{}{}
 			continue
 		}
-		host := l.Listen
+		host := strings.Trim(strings.TrimSpace(l.Listen), "[]")
 		if host == "" {
-			host = bind
+			host = strings.Trim(strings.TrimSpace(bind), "[]")
 		}
-		out = append(out, serve.Extra{Node: n, Addr: net.JoinHostPort(host, strconv.Itoa(l.Port))})
+		out = append(out, serve.Extra{Name: name, Node: n, Addr: net.JoinHostPort(host, strconv.Itoa(l.Port))})
+		seenNames[nameKey] = struct{}{}
 	}
-	return out
+	return out, nil
+}
+
+func policyNameKey(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func validateListenerName(name string) error {
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if strings.ContainsAny(name, "\r\n,=\\\"") || strings.ContainsFunc(name, unicode.IsControl) {
+		return fmt.Errorf("name contains unsupported characters")
+	}
+	if strings.HasPrefix(name, "#") || strings.HasPrefix(name, ";") {
+		return fmt.Errorf("name must not start with a comment marker")
+	}
+	for _, reserved := range []string{"Direct", "Block", "Proxy", "Auto - UrlTest", "Auto - Smart", "oixCloud"} {
+		if strings.EqualFold(name, reserved) {
+			return fmt.Errorf("name %q is reserved", name)
+		}
+	}
+	return nil
 }
 
 func splitListen(v string) (host, port string, ok bool) {
@@ -264,6 +318,15 @@ declaratively-bound fixed ports (see config.example.json).
 }
 
 func LoadNodes(cfg config.File, profilePath string) ([]dialer.Node, []byte, error) {
+	nodes, tmpl, err := loadNodesRaw(cfg, profilePath)
+	if err != nil {
+		return nil, tmpl, err
+	}
+	nodes, err = filterNodes(nodes, cfg.Filter)
+	return nodes, tmpl, err
+}
+
+func loadNodesRaw(cfg config.File, profilePath string) ([]dialer.Node, []byte, error) {
 	var nodes []dialer.Node
 	var tmpl []byte
 	if profilePath != "" {
@@ -294,14 +357,18 @@ func LoadNodes(cfg config.File, profilePath string) ([]dialer.Node, []byte, erro
 		}
 		nodes, tmpl = n, c.Template
 	}
-	nodes, err := profile.Filter(nodes, cfg.Filter)
-	if err != nil {
-		return nil, tmpl, err
-	}
-	if strings.TrimSpace(cfg.Filter) != "" && len(nodes) == 0 {
-		return nil, tmpl, fmt.Errorf("filter matched no nodes")
-	}
 	return nodes, tmpl, nil
+}
+
+func filterNodes(nodes []dialer.Node, filter string) ([]dialer.Node, error) {
+	filtered, err := profile.Filter(nodes, filter)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(filter) != "" && len(filtered) == 0 {
+		return nil, fmt.Errorf("filter matched no nodes")
+	}
+	return filtered, nil
 }
 
 func Find(nodes []dialer.Node, name string) (dialer.Node, error) {
@@ -314,17 +381,54 @@ func Find(nodes []dialer.Node, name string) (dialer.Node, error) {
 }
 
 func Healthcheck(addr string) error {
-	if _, _, err := net.SplitHostPort(addr); err != nil {
-		addr = net.JoinHostPort("127.0.0.1", addr)
+	addrs, err := healthcheckAddrs(addr)
+	if err != nil {
+		return err
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
+	var errs []error
+	for _, candidate := range addrs {
+		if err := checkHealth(client, candidate); err == nil {
+			return nil
+		} else {
+			errs = append(errs, fmt.Errorf("health %s: %w", candidate, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func healthcheckAddrs(addr string) ([]string, error) {
+	addr = strings.TrimSpace(addr)
+	if host, port, err := net.SplitHostPort(addr); err == nil {
+		if host != "" {
+			return []string{addr}, nil
+		}
+		addr = port
+	}
+	port, err := strconv.Atoi(addr)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("invalid healthcheck address %q", addr)
+	}
+	ps := strconv.Itoa(port)
+	return []string{net.JoinHostPort("127.0.0.1", ps), net.JoinHostPort("::1", ps)}, nil
+}
+
+func checkHealth(client *http.Client, addr string) error {
+	const maxBody = 64
+
 	resp, err := client.Get("http://" + addr + "/health")
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 || len(b) == 0 {
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+	if err != nil {
+		return err
+	}
+	if len(b) > maxBody {
+		return fmt.Errorf("health response exceeds %d bytes", maxBody)
+	}
+	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(b)) != "ok" {
 		return fmt.Errorf("health %d %q", resp.StatusCode, b)
 	}
 	return nil

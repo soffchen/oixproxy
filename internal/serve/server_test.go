@@ -225,7 +225,8 @@ func TestMappingsRecordListenerAuth(t *testing.T) {
 		},
 		Nodes: []dialer.Node{{Name: "loop", Server: "remote.example", Port: 443, PSK: "x", ECHConfig: "AAAA"}},
 		Extras: []Extra{{
-			Node: dialer.Node{Name: "lan", Server: "remote.example", Port: 443, PSK: "x", ECHConfig: "AAAA"},
+			Name: "lan",
+			Node: dialer.Node{Name: "upstream", Server: "remote.example", Port: 443, PSK: "x", ECHConfig: "AAAA"},
 			Addr: extraAddr,
 		}},
 		Dial: func(ctx context.Context, n dialer.Node, network, host string, port uint16) (net.Conn, error) {
@@ -270,5 +271,133 @@ func TestMappingsRecordListenerAuth(t *testing.T) {
 	resp.Body.Close()
 	if !strings.Contains(string(clash), `username: "alice"`) || strings.Count(string(clash), `username:`) != 1 {
 		t.Fatalf("clash: %s", clash)
+	}
+}
+
+func TestExtraMappingPublishesResolvedListenerAddress(t *testing.T) {
+	s := &Server{
+		NoHTTP: true,
+		Extras: []Extra{{
+			Node: dialer.Node{Name: "local", Server: "remote.example", Port: 443, PSK: "x", ECHConfig: "AAAA"},
+			Addr: "localhost:0",
+		}},
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	maps := s.Mappings()
+	if len(maps) != 1 {
+		t.Fatalf("maps %d", len(maps))
+	}
+	m := maps[0]
+	if net.ParseIP(m.Host) == nil || m.Port == 0 {
+		t.Fatalf("未记录实际监听地址: %+v", m)
+	}
+	list := ProxyList(maps, "198.51.100.10")
+	clash := ClashConfig(maps, "198.51.100.10")
+	if strings.Contains(list, "localhost") || strings.Contains(clash, "localhost") {
+		t.Fatalf("发布了原始绑定名:\nlist=%s\nclash=%s", list, clash)
+	}
+	if !strings.Contains(list, ", "+m.Host+", "+strconv.Itoa(m.Port)) || !strings.Contains(clash, "server: "+m.Host) {
+		t.Fatalf("未发布实际监听地址:\nlist=%s\nclash=%s", list, clash)
+	}
+}
+
+func TestTCPAddrHostPreservesIPv6Zone(t *testing.T) {
+	addr := &net.TCPAddr{IP: net.ParseIP("fe80::1"), Port: 7801, Zone: "en0"}
+	host := tcpAddrHost(addr)
+	if host != "fe80::1%en0" {
+		t.Fatalf("IPv6 作用域丢失: %q", host)
+	}
+	maps := []Mapping{{Node: dialer.Node{Name: "固定 IPv6"}, Host: host, Port: addr.Port}}
+	if list := ProxyList(maps, "198.51.100.10"); !strings.Contains(list, ", fe80::1%en0, 7801") {
+		t.Fatalf("列表未发布 IPv6 作用域: %s", list)
+	}
+	if clash := ClashConfig(maps, "198.51.100.10"); !strings.Contains(clash, "server: fe80::1%en0") {
+		t.Fatalf("Clash 未发布 IPv6 作用域: %s", clash)
+	}
+}
+
+func TestConfigServerHasResourceTimeouts(t *testing.T) {
+	s := &Server{Listen: "127.0.0.1:0"}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.httpSrv == nil {
+		t.Fatal("HTTP server 未启动")
+	}
+	if s.httpSrv.ReadHeaderTimeout <= 0 || s.httpSrv.WriteTimeout <= 0 || s.httpSrv.IdleTimeout <= 0 {
+		t.Fatalf("HTTP 资源超时未完整配置: %+v", s.httpSrv)
+	}
+}
+
+func TestCloseDoesNotHoldMappingLockDuringShutdown(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	s := &Server{maps: []Mapping{{Node: dialer.Node{Name: "node"}, Port: 7200}}}
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	handlerErr := make(chan error, 1)
+	s.httpLn = ln
+	s.httpSrv = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-proceed
+		if len(s.Mappings()) != 1 {
+			handlerErr <- io.ErrUnexpectedEOF
+			return
+		}
+		_, err := io.WriteString(w, "ok")
+		handlerErr <- err
+	})}
+	srv := s.httpSrv
+	go func() { _ = srv.Serve(ln) }()
+	requestDone := make(chan error, 1)
+	go func() {
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Get("http://" + ln.Addr().String())
+		if err == nil {
+			_, err = io.ReadAll(resp.Body)
+			resp.Body.Close()
+		}
+		requestDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("handler 未启动")
+	}
+	closeDone := make(chan struct{})
+	go func() {
+		s.Close()
+		close(closeDone)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(proceed)
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close 与 Mappings 发生锁等待")
+	}
+	select {
+	case err := <-handlerErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handler 未完成")
+	}
+	select {
+	case err := <-requestDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HTTP 请求未完成")
 	}
 }

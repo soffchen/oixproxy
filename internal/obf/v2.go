@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	Label = "oix-obf-v2-exp"
+	Label  = "oix-obf-v2-exp"
 	Prefix = "v2:"
 )
 

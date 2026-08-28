@@ -8,6 +8,7 @@ import (
 )
 
 func socksLine(m Mapping, host string) string {
+	host = mappingHost(m, host)
 	s := fmt.Sprintf("%s = socks5, %s, %d", m.Node.Name, host, m.Port)
 	if m.User != "" {
 		s += ", " + surgeQuote(m.User) + ", " + surgeQuote(m.Pass)
@@ -47,7 +48,7 @@ func ClashConfig(maps []Mapping, host string) string {
 	for _, m := range maps {
 		fmt.Fprintf(&b, "  - name: %q\n", m.Node.Name)
 		b.WriteString("    type: socks5\n")
-		fmt.Fprintf(&b, "    server: %s\n", host)
+		fmt.Fprintf(&b, "    server: %s\n", mappingHost(m, host))
 		fmt.Fprintf(&b, "    port: %d\n", m.Port)
 		if m.User != "" {
 			fmt.Fprintf(&b, "    username: %q\n", m.User)
@@ -58,6 +59,13 @@ func ClashConfig(maps []Mapping, host string) string {
 		}
 	}
 	return b.String()
+}
+
+func mappingHost(m Mapping, fallback string) string {
+	if m.Host != "" {
+		return m.Host
+	}
+	return fallback
 }
 
 // ProxyList is the official /list Surge policy-path body.
@@ -120,7 +128,8 @@ func RewriteSurge(template []byte, maps []Mapping, listenURL, host string) strin
 	var out []string
 	section := ""
 	wroteProxy := false
-	wroteAutos := false
+	wroteURLTest := false
+	wroteSmart := false
 	names := make([]string, 0, len(maps))
 	for _, m := range maps {
 		names = append(names, m.Node.Name)
@@ -134,9 +143,10 @@ func RewriteSurge(template []byte, maps []Mapping, listenURL, host string) strin
 			continue
 		}
 		if strings.HasPrefix(trim, "[") && strings.HasSuffix(trim, "]") {
-			if section == "[Proxy Group]" && !wroteAutos && len(names) > 0 {
-				out = append(out, autoGroups(names)...)
-				wroteAutos = true
+			if section == "[Proxy Group]" && len(names) > 0 {
+				out = append(out, missingAutoGroups(names, wroteURLTest, wroteSmart)...)
+				wroteURLTest = true
+				wroteSmart = true
 			}
 			section = trim
 			out = append(out, line)
@@ -173,13 +183,28 @@ func RewriteSurge(template []byte, maps []Mapping, listenURL, host string) strin
 				out = append(out, line)
 				continue
 			}
+			name := proxyGroupName(line)
+			switch {
+			case strings.EqualFold(name, "Auto - UrlTest"):
+				if !wroteURLTest {
+					out = append(out, rewriteAutoGroup(line, names))
+					wroteURLTest = true
+				}
+				continue
+			case strings.EqualFold(name, "Auto - Smart"):
+				if !wroteSmart {
+					out = append(out, rewriteAutoGroup(line, names))
+					wroteSmart = true
+				}
+				continue
+			}
 			out = append(out, expandGroup(line, names))
 		default:
 			out = append(out, line)
 		}
 	}
-	if strings.EqualFold(section, "[Proxy Group]") && !wroteAutos && len(names) > 0 {
-		out = append(out, autoGroups(names)...)
+	if strings.EqualFold(section, "[Proxy Group]") && len(names) > 0 {
+		out = append(out, missingAutoGroups(names, wroteURLTest, wroteSmart)...)
 	}
 	if !wroteProxy && len(maps) > 0 {
 		// template had no [Proxy]; append one
@@ -196,14 +221,9 @@ func RewriteSurge(template []byte, maps []Mapping, listenURL, host string) strin
 }
 
 func expandGroup(line string, names []string) string {
-	name, rest, ok := strings.Cut(line, " = ")
+	name, rest, ok := splitGroupLine(line)
 	if !ok {
-		name, rest, ok = strings.Cut(line, "=")
-		if !ok {
-			return line
-		}
-		name = strings.TrimSpace(name)
-		rest = strings.TrimSpace(rest)
+		return line
 	}
 	if strings.EqualFold(name, "Auto - UrlTest") || strings.EqualFold(name, "Auto - Smart") {
 		return line
@@ -243,18 +263,95 @@ func expandGroup(line string, names []string) string {
 	return name + " = " + strings.Join(kept, ", ")
 }
 
-func autoGroups(names []string) []string {
-	return []string{
-		"Auto - UrlTest = url-test, " + strings.Join(names, ", "),
-		"Auto - Smart = smart, " + strings.Join(names, ", "),
+func proxyGroupName(line string) string {
+	name, _, ok := splitGroupLine(line)
+	if !ok {
+		return ""
 	}
+	return name
+}
+
+// SurgeGroupNames 返回模板中已有的策略组名称。
+func SurgeGroupNames(template []byte) []string {
+	var names []string
+	seen := make(map[string]struct{})
+	inProxyGroup := false
+	for _, line := range strings.Split(string(template), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inProxyGroup = strings.EqualFold(trimmed, "[Proxy Group]")
+			continue
+		}
+		if !inProxyGroup || trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+			continue
+		}
+		name := proxyGroupName(line)
+		key := strings.ToLower(name)
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		names = append(names, name)
+	}
+	return names
+}
+
+func rewriteAutoGroup(line string, names []string) string {
+	name, rest, ok := splitGroupLine(line)
+	if !ok {
+		return line
+	}
+	parts := splitCSV(rest)
+	if len(parts) == 0 {
+		return line
+	}
+	rewritten := make([]string, 0, 1+len(names)+len(parts))
+	rewritten = append(rewritten, parts[0])
+	rewritten = append(rewritten, names...)
+	for _, part := range parts[1:] {
+		if _, _, ok := strings.Cut(part, "="); ok {
+			rewritten = append(rewritten, part)
+		}
+	}
+	return name + " = " + strings.Join(rewritten, ", ")
+}
+
+func splitGroupLine(line string) (name, rest string, ok bool) {
+	name, rest, ok = strings.Cut(line, "=")
+	if !ok {
+		return "", "", false
+	}
+	return strings.TrimSpace(name), strings.TrimSpace(rest), true
+}
+
+func missingAutoGroups(names []string, wroteURLTest, wroteSmart bool) []string {
+	var out []string
+	if !wroteURLTest {
+		out = append(out, "Auto - UrlTest = url-test, "+strings.Join(names, ", "))
+	}
+	if !wroteSmart {
+		out = append(out, "Auto - Smart = smart, "+strings.Join(names, ", "))
+	}
+	return out
 }
 
 func splitCSV(s string) []string {
 	var out []string
 	start := 0
+	quoted := false
+	escaped := false
 	for i := 0; i < len(s); i++ {
-		if s[i] == ',' {
+		switch {
+		case escaped:
+			escaped = false
+		case s[i] == '\\':
+			escaped = true
+		case s[i] == '"':
+			quoted = !quoted
+		case s[i] == ',' && !quoted:
 			out = append(out, strings.TrimSpace(s[start:i]))
 			start = i + 1
 		}

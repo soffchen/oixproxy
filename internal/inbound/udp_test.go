@@ -2,9 +2,13 @@ package inbound
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -15,6 +19,7 @@ type memPC struct {
 	addr net.Addr
 	ch   chan pkt
 	loc  net.Addr
+	err  error
 }
 
 type pkt struct {
@@ -39,6 +44,11 @@ func (m *memPC) ReadFrom(p []byte) (int, net.Addr, error) {
 
 func (m *memPC) WriteTo(p []byte, addr net.Addr) (int, error) {
 	m.mu.Lock()
+	if m.err != nil {
+		err := m.err
+		m.mu.Unlock()
+		return 0, err
+	}
 	m.got = append([]byte(nil), p...)
 	m.addr = addr
 	m.mu.Unlock()
@@ -408,4 +418,173 @@ func TestUDPAllowedPinsTCPPeerThenFirstAddr(t *testing.T) {
 	if _, ok := udpAllowed(peer, nil, mapped); !ok {
 		t.Fatal("ipv4-mapped peer IP must pass")
 	}
+}
+
+func TestSOCKS5UDPWriteErrorClosesAssociation(t *testing.T) {
+	want := errors.New("upstream write failed")
+	pc := &memPC{
+		ch:  make(chan pkt),
+		loc: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)},
+		err: want,
+	}
+	udp := func() (net.PacketConn, error) { return pc, nil }
+	h := func(network, host string, port uint16) (net.Conn, error) { return nil, io.ErrClosedPipe }
+	ln, err := ListenMixed("127.0.0.1:0", "", "", h, udp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = c.Write([]byte{0x05, 0x01, 0x00})
+	var greet [2]byte
+	if _, err := io.ReadFull(c, greet[:]); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = c.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(c, reply); err != nil {
+		t.Fatal(err)
+	}
+	port := int(binary.BigEndian.Uint16(reply[8:10]))
+	uc, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uc.Close()
+	if _, err := uc.Write([]byte{0, 0, 0, 0x01, 8, 8, 8, 8, 0, 53, 1}); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	if _, err := c.Read(one[:]); err == nil {
+		t.Fatal("上游 UDP 写失败后控制连接仍保持")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("上游 UDP 写失败被静默吞掉")
+	}
+}
+
+type retryPacketConn struct {
+	calls  atomic.Int32
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *retryPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	select {
+	case <-c.closed:
+		return 0, nil, net.ErrClosed
+	default:
+		c.calls.Add(1)
+		return 0, nil, temporaryTestError{}
+	}
+}
+
+func (*retryPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
+func (c *retryPacketConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+func (*retryPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (*retryPacketConn) SetDeadline(time.Time) error      { return nil }
+func (*retryPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*retryPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestUDPHubReadLoopKeepsRetryingTemporaryErrors(t *testing.T) {
+	pc := &retryPacketConn{closed: make(chan struct{})}
+	h := &udpHub{pc: pc, byClient: map[string]*udpSess{}}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- h.readLoop()
+	}()
+	select {
+	case err := <-errCh:
+		t.Logf("readLoop err=%v", err)
+		t.Fatalf("UDP readLoop 在 %d 次临时错误后退出", pc.calls.Load())
+	case <-time.After(350 * time.Millisecond):
+	}
+	if pc.calls.Load() == 0 {
+		t.Fatal("UDP readLoop 未调用 ReadFrom")
+	}
+	_ = pc.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("关闭 PacketConn 后 UDP readLoop 未退出")
+	}
+}
+
+func TestUDPHubReadLoopReturnsPermanentError(t *testing.T) {
+	want := errors.New("permanent udp failure")
+	pc := &permanentReadPacketConn{err: want}
+	h := &udpHub{pc: pc, byClient: map[string]*udpSess{}}
+	err := h.readLoop()
+	if !errors.Is(err, want) {
+		t.Fatalf("err=%v want=%v", err, want)
+	}
+}
+
+type oneReadErrorPacketConn struct {
+	memPC
+	calls int
+	err   error
+}
+
+func (c *oneReadErrorPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	c.calls++
+	if c.calls == 1 {
+		return 0, nil, &net.OpError{
+			Op:  "read",
+			Net: "udp",
+			Err: &os.SyscallError{Syscall: "recvfrom", Err: c.err},
+		}
+	}
+	return 0, nil, net.ErrClosed
+}
+
+func TestUDPHubReadLoopKeepsGoingAfterRetryableErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "异步拒绝", err: syscall.ECONNREFUSED},
+		{name: "缓冲区不足", err: syscall.ENOBUFS},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pc := &oneReadErrorPacketConn{err: tc.err}
+			h := &udpHub{pc: pc, byClient: map[string]*udpSess{}}
+			if err := h.readLoop(); err != nil {
+				t.Fatal(err)
+			}
+			if pc.calls != 2 {
+				t.Fatalf("ReadFrom 调用次数=%d", pc.calls)
+			}
+		})
+	}
+}
+
+type permanentReadPacketConn struct {
+	memPC
+	err error
+}
+
+func (c *permanentReadPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, c.err
+}
+
+func FuzzParseSOCKSUDP(f *testing.F) {
+	f.Add([]byte{0, 0, 0, 0x01, 8, 8, 8, 8, 0, 53, 1, 2, 3})
+	f.Add([]byte{0, 0, 0, 0x03, 3, 'a', '.', 'b', 0, 53})
+	f.Add([]byte{0, 0, 1})
+	f.Fuzz(func(t *testing.T, packet []byte) {
+		_, _, _, _ = parseSOCKSUDP(packet)
+	})
 }

@@ -19,15 +19,17 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Test
-        run: go test ./...
+      - name: Validate
+        run: ./scripts/validate.sh
 
       - name: Build
         env:
           VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+          DIST_DIR: ${{ runner.temp }}/oixproxy-dist
         run: |
           set -euo pipefail
-          mkdir -p dist
+          test -z "$(git status --porcelain)"
+          mkdir -p "$DIST_DIR"
           ldflags="-s -w -X github.com/soffchen/oixproxy/internal/run.Version=${VERSION}"
           for spec in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
             goos="${spec%/*}"
@@ -36,23 +38,26 @@ jobs:
             if [ "$goos" = windows ]; then
               ext=".exe"
             fi
-            out="dist/oixproxy-${goos}-${goarch}${ext}"
+            out="$DIST_DIR/oixproxy-${goos}-${goarch}${ext}"
             echo "building $out"
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags "$ldflags" -o "$out" ./cmd/oixproxy
           done
-          (cd dist && sha256sum * > SHA256SUMS)
+          (cd "$DIST_DIR" && sha256sum * > SHA256SUMS)
+          go version -m "$DIST_DIR/oixproxy-linux-amd64" | grep -q 'vcs.modified=false'
+          "$DIST_DIR/oixproxy-linux-amd64" --version | grep -Fq "$VERSION"
 
       - uses: actions/upload-artifact@v4
         with:
           name: oixproxy
-          path: dist/*
+          path: ${{ runner.temp }}/oixproxy-dist/*
 
       - name: GitHub Release
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
+          DIST_DIR: ${{ runner.temp }}/oixproxy-dist
         run: |
-          gh release create "${{ github.ref_name }}" dist/* \
+          gh release create "${{ github.ref_name }}" "$DIST_DIR"/* \
             --title "${{ github.ref_name }}" \
             --generate-notes \
             --verify-tag
