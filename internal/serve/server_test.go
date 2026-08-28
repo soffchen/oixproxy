@@ -101,6 +101,14 @@ func TestMappedPortSOCKSCONNECT(t *testing.T) {
 	}
 }
 
+func TestDialerForIgnoresPreconnectWithoutReuse(t *testing.T) {
+	s := &Server{}
+	_ = s.dialerFor(dialer.Node{Name: "hk", Preconnect: 2})
+	if len(s.pools) != 0 {
+		t.Fatalf("关闭复用后仍创建了 %d 个连接池", len(s.pools))
+	}
+}
+
 func TestConfigHTTPAuthRejects(t *testing.T) {
 	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

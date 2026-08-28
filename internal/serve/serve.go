@@ -179,7 +179,7 @@ func (s *Server) dialerFor(n dialer.Node) DialFunc {
 	if s.Dial != nil {
 		return s.Dial
 	}
-	if !n.Reuse && n.Preconnect <= 0 {
+	if !n.Reuse {
 		return dialer.Dial
 	}
 	if s.poolByName == nil {

@@ -1,10 +1,13 @@
 package snell
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -59,7 +62,7 @@ func TestZeroChunkSetsPeerClosed(t *testing.T) {
 	}
 }
 
-func TestReadReplySkipsLeftoverZeroChunk(t *testing.T) {
+func TestReadReplyRejectsLeftoverZeroChunk(t *testing.T) {
 	client, peer := pipeConns(t)
 	go func() {
 		if _, err := peer.Write([]byte{cmdTunnel}); err != nil {
@@ -82,12 +85,9 @@ func TestReadReplySkipsLeftoverZeroChunk(t *testing.T) {
 		t.Fatalf("read %q %v", buf[:n], err)
 	}
 	client.ResetReply()
-	if err := client.ReadReply(); err != nil {
-		t.Fatal(err)
-	}
-	n, err = client.Read(buf)
-	if err != nil || string(buf[:n]) != "re" {
-		t.Fatalf("second %q %v", buf[:n], err)
+	err = client.ReadReply()
+	if !errors.Is(err, ErrZeroChunk) {
+		t.Fatalf("遗留零块错误为 %v", err)
 	}
 }
 
@@ -106,34 +106,53 @@ func TestReadReplyPrematureEOFIsProtocolError(t *testing.T) {
 	}
 }
 
-func readWarmupRequest(peer *Conn) error {
+func readWarmupPing(peer *Conn) error {
 	if peer.r == nil {
 		if err := peer.initReader(); err != nil {
 			return err
 		}
 	}
-	if _, err := peer.r.readFrame(); err != nil {
+	p, err := peer.r.readFrame()
+	if err != nil {
 		return err
 	}
-	if _, err := peer.r.readFrame(); err != nil {
-		return err
+	want := []byte{headerVersion, cmdPing, 0}
+	if !bytes.Equal(p, want) {
+		return fmt.Errorf("PING 为 %v，期望 %v", p, want)
 	}
 	return nil
 }
 
-func TestWarmupCompletesOnTunnelReply(t *testing.T) {
+func TestWarmupPongKeepsConnectionForConnect(t *testing.T) {
 	client, peer := pipeConns(t)
 	errc := make(chan error, 1)
+	host := "example.com"
 	go func() {
-		if err := readWarmupRequest(peer); err != nil {
+		if err := readWarmupPing(peer); err != nil {
 			errc <- err
+			return
+		}
+		if _, err := peer.Write([]byte{cmdPong}); err != nil {
+			errc <- err
+			return
+		}
+		req, err := peer.r.readFrame()
+		if err != nil {
+			errc <- err
+			return
+		}
+		want := []byte{headerVersion, cmdConnectV2, 0, byte(len(host))}
+		want = append(want, host...)
+		want = append(want, 0x01, 0xbb)
+		if !bytes.Equal(req, want) {
+			errc <- fmt.Errorf("预热后的请求头为 %v", req)
 			return
 		}
 		if _, err := peer.Write([]byte{cmdTunnel}); err != nil {
 			errc <- err
 			return
 		}
-		if _, err := peer.r.readFrame(); err != nil && err != ErrZeroChunk {
+		if _, err := peer.Write([]byte("ok")); err != nil {
 			errc <- err
 			return
 		}
@@ -142,8 +161,16 @@ func TestWarmupCompletesOnTunnelReply(t *testing.T) {
 	if err := client.Warmup(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if client.PeerClosed() {
-		t.Fatal("successful warmup must ResetReply")
+	if err := client.WriteConnect(host, 443, true); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 8)
+	n, err := client.Read(buf)
+	if err != nil || string(buf[:n]) != "ok" {
+		t.Fatalf("同一传输读取 %q：%v", buf[:n], err)
+	}
+	if _, err := client.Read(buf); err != io.EOF {
+		t.Fatalf("同一传输结束错误为 %v", err)
 	}
 	select {
 	case err := <-errc:
@@ -155,62 +182,133 @@ func TestWarmupCompletesOnTunnelReply(t *testing.T) {
 	}
 }
 
-func TestWarmupRejectsDrainTimeout(t *testing.T) {
+func TestWarmupRejectsUnexpectedReply(t *testing.T) {
 	client, peer := pipeConns(t)
+	errc := make(chan error, 1)
 	go func() {
-		if err := readWarmupRequest(peer); err != nil {
+		if err := readWarmupPing(peer); err != nil {
+			errc <- err
 			return
 		}
 		if _, err := peer.Write([]byte{cmdTunnel}); err != nil {
+			errc <- err
 			return
 		}
-		_, _ = peer.r.readFrame() // client HalfClose
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), warmupDrainTimeout+time.Second)
-	defer cancel()
-	err := client.Warmup(ctx)
-	if err == nil {
-		t.Fatal("expected drain timeout")
-	}
-	if client.PeerClosed() {
-		t.Fatal("timeout must not set PeerClosed")
-	}
-}
-
-func TestWarmupRejectsTLSDrop(t *testing.T) {
-	client, peer := pipeConns(t)
-	raw := peer.Conn
-	go func() {
-		if err := readWarmupRequest(peer); err != nil {
-			return
-		}
-		if _, err := peer.Write([]byte{cmdTunnel}); err != nil {
-			return
-		}
-		if _, err := peer.r.readFrame(); err != nil && err != ErrZeroChunk {
-			return
-		}
-		_ = raw.Close()
+		errc <- nil
 	}()
 	err := client.Warmup(context.Background())
-	if err == nil {
-		t.Fatal("expected drain error")
+	if err == nil || !strings.Contains(err.Error(), "unexpected Snell warmup reply") {
+		t.Fatalf("意外回复错误为 %v", err)
 	}
-	if client.PeerClosed() {
-		t.Fatal("TLS drop must not set PeerClosed")
-	}
-	if errors.Is(err, ErrZeroChunk) {
-		t.Fatalf("zero-chunk: %v", err)
+	if err := <-errc; err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestTLSClientHelloNotEmpty(t *testing.T) {
-	hello, err := tlsClientHello(warmupHost)
+func TestWarmupHonorsContextDeadline(t *testing.T) {
+	client, peer := pipeConns(t)
+	pingRead := make(chan error, 1)
+	go func() {
+		pingRead <- readWarmupPing(peer)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := client.Warmup(ctx)
+	if err == nil {
+		t.Fatal("预热等待 PONG 应超时")
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("预热超时耗时过长：%s", time.Since(start))
+	}
+	if err := <-pingRead; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type shortWriter struct {
+	bytes.Buffer
+	max int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.max {
+		p = p[:w.max]
+	}
+	return w.Buffer.Write(p)
+}
+
+type zeroWriter struct{}
+
+func (zeroWriter) Write([]byte) (int, error) { return 0, nil }
+
+func TestWriteFullHandlesShortWrites(t *testing.T) {
+	w := &shortWriter{max: 3}
+	want := []byte("0123456789")
+	if err := writeFull(w, want); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(w.Bytes(), want) {
+		t.Fatalf("写入结果为 %q", w.Bytes())
+	}
+	if err := writeFull(zeroWriter{}, want); err != io.ErrShortWrite {
+		t.Fatalf("零字节短写错误为 %v", err)
+	}
+}
+
+func TestV4WriterCompletesShortUnderlyingWrites(t *testing.T) {
+	const psk = "test-psk"
+	raw := &shortWriter{max: 3}
+	w, err := newWriter(raw, []byte(psk), nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(hello) < 40 || hello[0] != 22 {
-		t.Fatalf("not a TLS handshake record: len=%d first=%d", len(hello), hello[0])
+	want := []byte("payload")
+	if _, err := w.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	data := raw.Bytes()
+	if len(data) <= saltSize {
+		t.Fatalf("底层只写入了 %d 字节", len(data))
+	}
+	aead, err := newAESGCM(kdf([]byte(psk), data[:saltSize]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &v4Reader{r: bytes.NewReader(data[saltSize:]), aead: aead}
+	got, err := r.readFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("解密载荷为 %q，期望 %q", got, want)
+	}
+}
+
+func TestFirstPayloadLimitIncludesIdentityPrefix(t *testing.T) {
+	const padding = 0x100
+	tests := []struct {
+		name            string
+		identityVersion int
+		exporterSize    int
+		identity        int
+	}{
+		{name: "无身份头"},
+		{name: "DLSNID01", identityVersion: 1, identity: 24},
+		{name: "DLSNID02", identityVersion: 2, exporterSize: 32, identity: 40},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := v4Writer{
+				initPad:         padding,
+				identityVersion: tt.identityVersion,
+				exporter:        make([]byte, tt.exporterSize),
+			}
+			want := uint16(frameSize - 55 - padding - tt.identity)
+			if got := w.nextPayloadLimit(); got != want {
+				t.Fatalf("首帧载荷上限为 %d，期望 %d", got, want)
+			}
+		})
 	}
 }
 

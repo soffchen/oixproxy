@@ -5,7 +5,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	cryptorand "crypto/rand"
-	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -25,10 +24,12 @@ import (
 const (
 	Version4 = 4
 
+	cmdPing      byte = 0
 	cmdConnect   byte = 1
 	cmdConnectV2 byte = 5
 	cmdUDP       byte = 6
 	cmdTunnel    byte = 0
+	cmdPong      byte = 1
 	cmdError     byte = 2
 
 	headerVersion byte = 1
@@ -41,10 +42,6 @@ const (
 	frameSize        = 1460
 	initialPadMin    = 0x100
 	initialPadSpan   = 0x100
-
-	warmupDrainTimeout = 3 * time.Second
-	warmupHost         = "www.gstatic.com"
-	warmupPort         = uint16(443)
 )
 
 // ErrZeroChunk is a v4 empty payload: the peer half-closed a reused stream.
@@ -149,40 +146,31 @@ func (c *Conn) ReadReply() error {
 			return fmt.Errorf("snell reply: %w", err)
 		}
 	}
-	for {
-		var cmd [1]byte
-		_, err := io.ReadFull(c.r, cmd[:])
-		if errors.Is(err, ErrZeroChunk) {
-			// Leftover half-close from the previous reused stream.
-			c.peerClosed.Store(false)
-			continue
+	var cmd [1]byte
+	if _, err := io.ReadFull(c.r, cmd[:]); err != nil {
+		return fmt.Errorf("snell reply: %w", err)
+	}
+	c.reply = true
+	switch cmd[0] {
+	case cmdTunnel:
+		return nil
+	case cmdError:
+		var rest [2]byte
+		if _, err := io.ReadFull(c.r, rest[:]); err != nil {
+			return fmt.Errorf("snell error reply: %w", err)
 		}
-		if err != nil {
-			return fmt.Errorf("snell reply: %w", err)
+		msg := make([]byte, int(rest[1]))
+		if _, err := io.ReadFull(c.r, msg); err != nil {
+			return fmt.Errorf("snell error reply: %w", err)
 		}
-		c.reply = true
-		switch cmd[0] {
-		case cmdTunnel:
-			return nil
-		case cmdError:
-			var rest [2]byte
-			if _, err := io.ReadFull(c.r, rest[:]); err != nil {
-				return fmt.Errorf("snell error reply: %w", err)
-			}
-			msg := make([]byte, int(rest[1]))
-			if _, err := io.ReadFull(c.r, msg); err != nil {
-				return fmt.Errorf("snell error reply: %w", err)
-			}
-			return fmt.Errorf("snell server code %d: %s", rest[0], msg)
-		default:
-			return fmt.Errorf("snell unexpected reply %d", cmd[0])
-		}
+		return fmt.Errorf("snell server code %d: %s", rest[0], msg)
+	default:
+		return fmt.Errorf("snell unexpected reply %d", cmd[0])
 	}
 }
 
-// Warmup runs a throwaway CONNECT-V2 and waits for the peer zero-chunk so
-// the transport can be pooled. A TLS ClientHello is written before ReadReply
-// because some servers only send cmdTunnel after the origin's first packet.
+// Warmup 用 PING/PONG 校验新建的 v4 传输，不消耗 CONNECT 复用次数。
+// oixCloud 扩展的 PING 仍带零长度 clientID，PONG 后同一传输继续接收 CONNECT。
 func (c *Conn) Warmup(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -194,77 +182,22 @@ func (c *Conn) Warmup(ctx context.Context) error {
 		_ = c.SetDeadline(dl)
 		defer func() { _ = c.SetDeadline(time.Time{}) }()
 	}
-	if err := c.WriteConnect(warmupHost, warmupPort, true); err != nil {
-		return err
-	}
-	hello, err := tlsClientHello(warmupHost)
-	if err != nil {
+	if _, err := c.Write([]byte{headerVersion, cmdPing, 0}); err != nil {
 		return fmt.Errorf("snell warmup: %w", err)
 	}
-	if _, err := c.Write(hello); err != nil {
-		return err
+	if c.r == nil {
+		if err := c.initReader(); err != nil {
+			return fmt.Errorf("snell warmup: %w", err)
+		}
 	}
-	if err := c.ReadReply(); err != nil {
+	var reply [1]byte
+	if _, err := io.ReadFull(c.r, reply[:]); err != nil {
 		return fmt.Errorf("snell warmup: %w", err)
 	}
-	if err := c.HalfClose(); err != nil {
-		return err
+	if reply[0] != cmdPong {
+		return fmt.Errorf("unexpected Snell warmup reply: %d", reply[0])
 	}
-	drainTo := time.Now().Add(warmupDrainTimeout)
-	if dl, ok := ctx.Deadline(); ok && dl.Before(drainTo) {
-		drainTo = dl
-	}
-	_ = c.SetReadDeadline(drainTo)
-	buf := make([]byte, 1024)
-	var drainErr error
-	for {
-		if err := ctx.Err(); err != nil {
-			_ = c.SetReadDeadline(time.Time{})
-			return err
-		}
-		_, err := c.Read(buf)
-		if err != nil {
-			drainErr = err
-			break
-		}
-	}
-	_ = c.SetReadDeadline(time.Time{})
-	if !c.PeerClosed() {
-		if drainErr != nil {
-			return fmt.Errorf("snell warmup drain: %w", drainErr)
-		}
-		return errors.New("snell warmup: peer did not half-close")
-	}
-	c.ResetReply()
 	return nil
-}
-
-type helloConn struct {
-	hello []byte
-}
-
-func (c *helloConn) Read([]byte) (int, error)         { return 0, io.EOF }
-func (c *helloConn) Write(p []byte) (int, error)      { c.hello = append(c.hello, p...); return len(p), nil }
-func (c *helloConn) Close() error                     { return nil }
-func (c *helloConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
-func (c *helloConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
-func (c *helloConn) SetDeadline(time.Time) error      { return nil }
-func (c *helloConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *helloConn) SetWriteDeadline(time.Time) error { return nil }
-
-func tlsClientHello(serverName string) ([]byte, error) {
-	var hc helloConn
-	tc := tls.Client(&hc, &tls.Config{
-		ServerName:         serverName,
-		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS12,
-		NextProtos:         []string{"http/1.1"},
-	})
-	_ = tc.Handshake()
-	if len(hc.hello) == 0 {
-		return nil, errors.New("empty clienthello")
-	}
-	return hc.hello, nil
 }
 
 // HalfClose writes a v4 zero chunk so a reused session can take another CONNECT.
@@ -495,7 +428,7 @@ func (w *v4Writer) nextPayloadLimit() uint16 {
 	var limit uint16
 	switch {
 	case w.lastWrite.IsZero():
-		limit = uint16(int(frameSize) - 55 - int(w.initPad))
+		limit = uint16(int(frameSize) - 55 - w.identityWireLength() - int(w.initPad))
 	case now.Sub(w.lastWrite) > 30*time.Second:
 		limit = frameSize - 39
 	default:
@@ -508,6 +441,16 @@ func (w *v4Writer) nextPayloadLimit() uint16 {
 	}
 	w.payLimit = uint16(next)
 	return limit
+}
+
+func (w *v4Writer) identityWireLength() int {
+	if w.identityVersion == 1 {
+		return identity.V1PrefixSize
+	}
+	if len(w.exporter) == identity.ExporterSize {
+		return identity.V2PrefixSize
+	}
+	return 0
 }
 
 func (w *v4Writer) writeFrame(payload []byte, padLen int) error {
@@ -564,8 +507,21 @@ func (w *v4Writer) writeFrame(payload []byte, padLen int) error {
 	frame = append(frame, headerCipher...)
 	frame = append(frame, padding...)
 	frame = append(frame, payloadCipher...)
-	_, err := w.w.Write(frame)
-	return err
+	return writeFull(w.w, frame)
+}
+
+func writeFull(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		b = b[n:]
+	}
+	return nil
 }
 
 func swapPadding(padding, payloadCipher []byte) {
